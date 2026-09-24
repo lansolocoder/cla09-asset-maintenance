@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 import os
 from pathlib import Path
 import re
@@ -33,6 +33,11 @@ CREATE TABLE IF NOT EXISTS assets (
 
 STATUS_IN_USE = "in_use"
 
+RESIDUAL_RATE = Decimal("0.05")
+DEPRECIATION_YEARS = 5
+_MONTHS_PER_YEAR = 12
+_CENT = Decimal("0.01")
+
 
 class LedgerError(Exception):
     """A business-rule violation that must be reported to the user."""
@@ -55,13 +60,13 @@ def _require_non_empty(field: str, value: str) -> str:
     return value
 
 
-def _validate_date(value: str) -> str:
+def _validate_date(value: str, field: str = "purchase date") -> str:
     if not _DATE_RE.fullmatch(value):
-        raise LedgerError(f"purchase date must be in YYYY-MM-DD format: {value!r}")
+        raise LedgerError(f"{field} must be in YYYY-MM-DD format: {value!r}")
     try:
         date.fromisoformat(value)
     except ValueError:
-        raise LedgerError(f"purchase date is not a valid date: {value!r}") from None
+        raise LedgerError(f"{field} is not a valid date: {value!r}") from None
     return value
 
 
@@ -162,3 +167,76 @@ def query_assets(
     with _connect(db_path) as connection:
         rows = connection.execute(statement, parameters).fetchall()
     return [_row_to_asset(row) for row in rows]
+
+
+@dataclass(frozen=True)
+class DepreciationReport:
+    asset_id: str
+    purchase_amount: Decimal
+    residual_amount: Decimal
+    as_of: str
+    elapsed_months: int
+    monthly_depreciation: Decimal
+    accumulated_depreciation: Decimal
+    net_book_value: Decimal
+
+
+def find_asset(asset_id: str, db_path: Path = DB_PATH) -> Asset | None:
+    """Return the asset with the given id, or None if it is not registered."""
+    with _connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT asset_id, name, category, location, purchase_date, "
+            "purchase_amount, status FROM assets WHERE asset_id = ?",
+            (asset_id,),
+        ).fetchone()
+    return _row_to_asset(row) if row is not None else None
+
+
+def _round_cents(value: Decimal) -> Decimal:
+    return value.quantize(_CENT, rounding=ROUND_HALF_UP)
+
+
+def _elapsed_months(purchase: date, as_of: date) -> int:
+    """Whole months between two dates; a partial month does not count."""
+    if as_of < purchase:
+        return 0
+    months = (as_of.year - purchase.year) * 12 + (as_of.month - purchase.month)
+    if as_of.day < purchase.day:
+        months -= 1
+    return months
+
+
+def compute_depreciation(
+    asset_id: str,
+    as_of: str | None = None,
+    db_path: Path = DB_PATH,
+) -> DepreciationReport:
+    """Straight-line depreciation report; read-only, raises LedgerError on bad input."""
+    if as_of is None:
+        as_of_date = date.today()
+        as_of = as_of_date.isoformat()
+    else:
+        _validate_date(as_of, field="as-of date")
+        as_of_date = date.fromisoformat(as_of)
+    asset = find_asset(asset_id, db_path)
+    if asset is None:
+        raise LedgerError(f"asset id not found: {asset_id!r}")
+    purchase_amount = asset.purchase_amount
+    residual_amount = _round_cents(purchase_amount * RESIDUAL_RATE)
+    monthly_depreciation = _round_cents(
+        (purchase_amount - residual_amount) / (DEPRECIATION_YEARS * _MONTHS_PER_YEAR)
+    )
+    elapsed_months = _elapsed_months(date.fromisoformat(asset.purchase_date), as_of_date)
+    accumulated_depreciation = _round_cents(monthly_depreciation * elapsed_months)
+    accumulated_depreciation = min(accumulated_depreciation, purchase_amount - residual_amount)
+    net_book_value = purchase_amount - accumulated_depreciation
+    return DepreciationReport(
+        asset_id=asset.asset_id,
+        purchase_amount=purchase_amount,
+        residual_amount=residual_amount,
+        as_of=as_of,
+        elapsed_months=elapsed_months,
+        monthly_depreciation=monthly_depreciation,
+        accumulated_depreciation=accumulated_depreciation,
+        net_book_value=net_book_value,
+    )
