@@ -240,5 +240,176 @@ class BusinessTests(unittest.TestCase):
         self.assertTrue(self.db.exists())
 
 
+class PlanTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.db = self.tmp / "asset_ledger.db"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "asset_ledger", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=ENV,
+        )
+
+    def register(self, tag: str = "A001") -> None:
+        result = self.invoke(
+            "register", "--db", str(self.db),
+            "--tag", tag, "--name", "n", "--category", "c",
+            "--purchase-date", "2026-01-15", "--location", "loc",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def plan_add(self, tag: str = "A001", name: str = "除尘保养", **overrides: str):
+        cmd = ["plan-add", "--db", str(self.db), "--tag", tag, "--name", name]
+        for key, value in overrides.items():
+            cmd += [f"--{key}", value]
+        return self.invoke(*cmd)
+
+    def test_plan_add_with_next_due(self) -> None:
+        self.register()
+        result = self.plan_add(**{"next-due": "2026-10-01"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        lines = result.stdout.splitlines()
+        self.assertEqual(
+            lines,
+            ["计划编号: 1", "计划名称: 除尘保养", "资产标签: A001",
+             "下次到期日期: 2026-10-01"],
+        )
+
+    def test_plan_add_with_cycle_computes_due_date(self) -> None:
+        self.register()
+        result = self.plan_add(
+            **{"cycle-days": "90", "start-date": "2026-09-01"}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("下次到期日期: 2026-11-30", result.stdout)
+
+    def test_plan_add_requires_exactly_one_due_mode(self) -> None:
+        self.register()
+        both = self.plan_add(**{"next-due": "2026-10-01", "cycle-days": "90",
+                             "start-date": "2026-09-01"})
+        self.assertNotEqual(both.returncode, 0)
+        self.assertIn("二选一", both.stderr)
+        neither = self.plan_add()
+        self.assertNotEqual(neither.returncode, 0)
+        partial = self.plan_add(**{"cycle-days": "90"})
+        self.assertNotEqual(partial.returncode, 0)
+        listed = self.invoke("plan-list", "--db", str(self.db), "--tag", "A001")
+        self.assertIn("尚无维保计划", listed.stdout)
+
+    def test_plan_add_rejects_non_positive_cycle(self) -> None:
+        self.register()
+        for bad in ["0", "-3"]:
+            with self.subTest(bad=bad):
+                result = self.plan_add(
+                    **{"cycle-days": bad, "start-date": "2026-09-01"}
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("正整数", result.stderr)
+
+    def test_plan_add_rejects_bad_dates_and_missing_asset(self) -> None:
+        bad = self.plan_add(**{"next-due": "2026-13-01"})
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("YYYY-MM-DD", bad.stderr)
+        self.assertFalse(self.db.exists())
+        self.register()
+        missing = self.plan_add(tag="GHOST", **{"next-due": "2026-10-01"})
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("目标资产不存在", missing.stderr)
+        listed = self.invoke("plan-list", "--db", str(self.db), "--tag", "A001")
+        self.assertIn("尚无维保计划", listed.stdout)
+
+    def test_plan_name_unique_per_asset(self) -> None:
+        self.register()
+        self.register("B002")
+        self.plan_add(**{"next-due": "2026-10-01"})
+        dup = self.plan_add(**{"next-due": "2026-11-01"})
+        self.assertNotEqual(dup.returncode, 0)
+        self.assertIn("计划名称重复", dup.stderr)
+        other_asset = self.plan_add(tag="B002", **{"next-due": "2026-10-01"})
+        self.assertEqual(other_asset.returncode, 0, other_asset.stderr)
+
+    def test_plan_add_idempotent_request_id(self) -> None:
+        self.register()
+        first = self.plan_add(**{"next-due": "2026-10-01", "request-id": "p-1"})
+        second = self.plan_add(**{"next-due": "2026-10-01", "request-id": "p-1"})
+        self.assertEqual(first.returncode, 0)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(first.stdout, second.stdout)
+        listed = self.invoke("plan-list", "--db", str(self.db), "--tag", "A001")
+        self.assertEqual(listed.stdout.count("除尘保养"), 1)
+
+        clash = self.plan_add(name="别的计划", **{"next-due": "2026-10-01",
+                                                  "request-id": "p-1"})
+        self.assertNotEqual(clash.returncode, 0)
+        self.assertIn("请求标识", clash.stderr)
+
+        # A failed attempt does not occupy the request id.
+        failed = self.plan_add(**{"next-due": "2026-10-01", "request-id": "p-2"})
+        self.assertNotEqual(failed.returncode, 0)  # duplicate plan name
+        ok = self.plan_add(name="电池检测", **{"next-due": "2026-10-01",
+                                             "request-id": "p-2"})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertIn("计划编号: 2", ok.stdout)
+
+    def test_plan_list_orders_by_name_and_shows_cycle(self) -> None:
+        self.register()
+        self.plan_add(name="电池检测", **{"cycle-days": "90",
+                                        "start-date": "2026-09-01"})
+        self.plan_add(name="除尘保养", **{"next-due": "2026-10-01"})
+        listed = self.invoke("plan-list", "--db", str(self.db), "--tag", "A001")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        lines = listed.stdout.splitlines()
+        self.assertEqual(
+            lines,
+            ["计划名称: 电池检测 周期天数: 90 下次到期日期: 2026-11-30",
+             "计划名称: 除尘保养 周期天数: 无 下次到期日期: 2026-10-01"],
+        )
+
+    def test_plan_list_missing_asset_fails(self) -> None:
+        result = self.invoke("plan-list", "--db", str(self.db), "--tag", "X")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.db.exists())
+
+    def test_plan_due_statuses_and_sorting(self) -> None:
+        self.register()
+        self.register("B002")
+        self.plan_add(name="过期", **{"next-due": "2026-09-20"})
+        self.plan_add(name="当天", **{"next-due": "2026-09-24"})
+        self.plan_add(name="临近", **{"next-due": "2026-09-30"})
+        self.plan_add(name="遥远", **{"next-due": "2026-10-05"})
+        self.plan_add(tag="B002", name="也临近", **{"next-due": "2026-09-28"})
+        result = self.invoke("plan-due", "--db", str(self.db),
+                             "--as-of", "2026-09-24")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertEqual(
+            lines,
+            ["资产标签: A001 计划名称: 过期 到期日期: 2026-09-20 状态: 已到期 剩余天数: -4",
+             "资产标签: A001 计划名称: 当天 到期日期: 2026-09-24 状态: 已到期 剩余天数: 0",
+             "资产标签: B002 计划名称: 也临近 到期日期: 2026-09-28 状态: 即将到期 剩余天数: 4",
+             "资产标签: A001 计划名称: 临近 到期日期: 2026-09-30 状态: 即将到期 剩余天数: 6"],
+        )
+
+    def test_plan_due_no_match_and_missing_db(self) -> None:
+        result = self.invoke("plan-due", "--db", str(self.db),
+                             "--as-of", "2026-09-24")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "无到期或即将到期的计划")
+        self.assertFalse(self.db.exists())
+        bad = self.invoke("plan-due", "--db", str(self.db), "--as-of", "24/09/2026")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("YYYY-MM-DD", bad.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

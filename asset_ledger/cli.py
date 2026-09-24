@@ -84,6 +84,45 @@ def build_parser() -> argparse.ArgumentParser:
     list_cmd.add_argument("--category", default=None, help="按类别筛选")
     list_cmd.set_defaults(func=cmd_list)
 
+    plan_add = subparsers.add_parser(
+        "plan-add", parents=[sub_common], help="为已登记资产建立维保计划"
+    )
+    _add_tag_arg(plan_add)
+    plan_add.add_argument("--name", required=True, help="计划名称（同一资产下唯一）")
+    plan_add.add_argument(
+        "--next-due", dest="next_due", default=None,
+        help="下次到期日期（YYYY-MM-DD），与 --cycle-days/--start-date 二选一",
+    )
+    plan_add.add_argument(
+        "--cycle-days", dest="cycle_days", type=int, default=None,
+        help="维保周期天数（正整数），需配合 --start-date",
+    )
+    plan_add.add_argument(
+        "--start-date", dest="start_date", default=None,
+        help="周期起算日期（YYYY-MM-DD），需配合 --cycle-days",
+    )
+    plan_add.add_argument(
+        "--request-id",
+        dest="request_id",
+        default=None,
+        help="请求标识，携带后可安全重试（同一标识重复提交返回同一结果）",
+    )
+    plan_add.set_defaults(func=cmd_plan_add)
+
+    plan_list = subparsers.add_parser(
+        "plan-list", parents=[sub_common], help="列出某资产的全部维保计划"
+    )
+    _add_tag_arg(plan_list)
+    plan_list.set_defaults(func=cmd_plan_list)
+
+    plan_due = subparsers.add_parser(
+        "plan-due", parents=[sub_common], help="按基准日查询到期或即将到期的计划"
+    )
+    plan_due.add_argument(
+        "--as-of", dest="as_of", required=True, help="基准日期（YYYY-MM-DD）"
+    )
+    plan_due.set_defaults(func=cmd_plan_due)
+
     return parser
 
 
@@ -201,6 +240,89 @@ def cmd_list(args: argparse.Namespace, out, err) -> int:
                 f" 当前位置:{row['current_location']}",
                 file=out,
             )
+        return 0
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def cmd_plan_add(args: argparse.Namespace, out, err) -> int:
+    # Validate before touching the filesystem so an invalid request never
+    # creates an empty data file.
+    tag, name, cycle_days, start_date, _due = db.validate_plan(
+        args.tag, args.name, args.next_due, args.cycle_days, args.start_date
+    )
+    db_path = Path(args.db)
+    existed = db_path.exists()
+    conn = _open(db_path, need_write=True)
+    closed = False
+    try:
+        try:
+            plan_id, tag, name, due = db.add_plan(
+                conn,
+                tag=tag,
+                name=name,
+                next_due=args.next_due,
+                cycle_days=cycle_days,
+                start_date=start_date,
+                request_id=args.request_id,
+            )
+        except db.LedgerError:
+            # A failed first plan registration must not leave an empty file.
+            if not existed:
+                conn.close()
+                closed = True
+                db_path.unlink(missing_ok=True)
+            raise
+    finally:
+        if not closed:
+            conn.close()
+    print(f"计划编号: {plan_id}", file=out)
+    print(f"计划名称: {name}", file=out)
+    print(f"资产标签: {tag}", file=out)
+    print(f"下次到期日期: {due}", file=out)
+    return 0
+
+
+def cmd_plan_list(args: argparse.Namespace, out, err) -> int:
+    conn = _open(args.db, need_write=False)
+    try:
+        asset = db.get_asset(conn, args.tag) if conn is not None else None
+        if asset is None:
+            print(f"错误: 未找到资产标签 {args.tag!r}", file=err)
+            return 1
+        plans = db.list_plans(conn, asset["id"])
+        if not plans:
+            print("尚无维保计划", file=out)
+        else:
+            for plan in plans:
+                cycle = plan["cycle_days"] if plan["cycle_days"] is not None else "无"
+                print(
+                    f"计划名称: {plan['name']} 周期天数: {cycle}"
+                    f" 下次到期日期: {plan['next_due']}",
+                    file=out,
+                )
+        return 0
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def cmd_plan_due(args: argparse.Namespace, out, err) -> int:
+    as_of = db.validate_as_of(args.as_of)
+    conn = _open(args.db, need_write=False)
+    try:
+        rows = db.due_plans(conn, as_of) if conn is not None else []
+        if not rows:
+            print("无到期或即将到期的计划", file=out)
+        else:
+            for row in rows:
+                print(
+                    f"资产标签: {row['tag']} 计划名称: {row['plan_name']}"
+                    f" 到期日期: {row['next_due']} 状态: {row['status']}"
+                    f" 剩余天数: {row['remaining']}",
+                    file=out,
+                )
         return 0
     finally:
         if conn is not None:
