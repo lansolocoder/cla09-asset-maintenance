@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import os
 from pathlib import Path
 import re
@@ -18,6 +18,10 @@ DB_PATH = Path(
 
 _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _AMOUNT_RE = re.compile(r"\d+(\.\d{1,2})?")
+_YEARS_RE = re.compile(r"[0-9]+")
+_RATE_RE = re.compile(r"[0-9]+\.[0-9]{2}")
+
+_TWO_PLACES = Decimal("0.01")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS assets (
@@ -75,7 +79,43 @@ def _validate_amount(value: str) -> Decimal:
         amount = Decimal(value)
     except InvalidOperation:
         raise LedgerError(f"purchase amount is not a number: {value!r}") from None
-    return amount.quantize(Decimal("0.01"))
+    return amount.quantize(_TWO_PLACES)
+
+
+def _validate_calendar_date(field: str, value: str) -> date:
+    if not _DATE_RE.fullmatch(value):
+        raise LedgerError(f"{field} must be in YYYY-MM-DD format: {value!r}")
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise LedgerError(f"{field} is not a valid date: {value!r}") from None
+
+
+def _validate_useful_life_years(value: str) -> int:
+    if not _YEARS_RE.fullmatch(value):
+        raise LedgerError(
+            f"useful life years must be a positive integer: {value!r}"
+        )
+    years = int(value)
+    if years <= 0:
+        raise LedgerError(
+            f"useful life years must be a positive integer: {value!r}"
+        )
+    return years
+
+
+def _validate_salvage_rate(value: str) -> Decimal:
+    if not _RATE_RE.fullmatch(value):
+        raise LedgerError(
+            "salvage rate must be a decimal between 0 and 1 with exactly "
+            f"two fraction digits: {value!r}"
+        )
+    rate = Decimal(value)
+    if not Decimal("0.00") <= rate <= Decimal("1.00"):
+        raise LedgerError(
+            "salvage rate must be between 0 and 1 inclusive: " f"{value!r}"
+        )
+    return rate
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
@@ -162,3 +202,75 @@ def query_assets(
     with _connect(db_path) as connection:
         rows = connection.execute(statement, parameters).fetchall()
     return [_row_to_asset(row) for row in rows]
+
+
+def get_asset(asset_id: str, db_path: Path = DB_PATH) -> Asset | None:
+    """Return the asset with the given id, or None if it does not exist."""
+    with _connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT asset_id, name, category, location, purchase_date, "
+            "purchase_amount, status FROM assets WHERE asset_id = ?",
+            (asset_id,),
+        ).fetchone()
+    return _row_to_asset(row) if row is not None else None
+
+
+@dataclass(frozen=True)
+class DepreciationResult:
+    asset_id: str
+    as_of: str
+    purchase_amount: Decimal
+    salvage_value: Decimal
+    accumulated_depreciation: Decimal
+    book_value: Decimal
+
+
+def depreciate_asset(
+    asset_id: str,
+    as_of: str,
+    useful_life_years: str,
+    salvage_rate: str,
+    db_path: Path = DB_PATH,
+) -> DepreciationResult:
+    """Compute straight-line depreciation for one asset up to ``as_of``.
+
+    Read-only: raises LedgerError on any validation failure or unknown asset
+    without modifying the database.
+    """
+    years = _validate_useful_life_years(useful_life_years)
+    rate = _validate_salvage_rate(salvage_rate)
+    end_date = _validate_calendar_date("as of date", as_of)
+
+    asset = get_asset(asset_id, db_path=db_path)
+    if asset is None:
+        raise LedgerError(f"asset id not found: {asset_id!r}")
+
+    purchase_amount = asset.purchase_amount
+    salvage_value = (purchase_amount * rate).quantize(_TWO_PLACES, ROUND_HALF_UP)
+    depreciable_base = purchase_amount - salvage_value
+    total_life_days = years * 365
+
+    purchase_day = date.fromisoformat(asset.purchase_date)
+    elapsed_days = (end_date - purchase_day).days
+    if elapsed_days <= 0:
+        elapsed_days = 0
+    elif elapsed_days > total_life_days:
+        elapsed_days = total_life_days
+
+    depreciation_cap = depreciable_base
+    accumulated = (
+        depreciable_base * elapsed_days / total_life_days
+    ).quantize(_TWO_PLACES, ROUND_HALF_UP)
+    if accumulated > depreciation_cap:
+        accumulated = depreciation_cap
+    book_value = purchase_amount - accumulated
+
+    return DepreciationResult(
+        asset_id=asset.asset_id,
+        as_of=as_of,
+        purchase_amount=purchase_amount,
+        salvage_value=salvage_value,
+        accumulated_depreciation=accumulated,
+        book_value=book_value,
+    )
+

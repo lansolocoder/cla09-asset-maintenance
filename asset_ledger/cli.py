@@ -6,7 +6,7 @@ import json
 import sys
 
 from . import __version__
-from .ledger import Asset, LedgerError, query_assets, register_asset
+from .ledger import Asset, LedgerError, depreciate_asset, query_assets, register_asset
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -28,6 +28,18 @@ def _build_parser() -> argparse.ArgumentParser:
     query = subparsers.add_parser("query", help="查询资产台账")
     query.add_argument("--category", help="按分类过滤")
     query.add_argument("--location", help="按存放位置过滤")
+
+    depreciate = subparsers.add_parser(
+        "depreciate", help="按直线法计算资产折旧与账面价值"
+    )
+    depreciate.add_argument("--asset-id", required=True, help="资产编号")
+    depreciate.add_argument("--as-of", required=True, help="截止日期 YYYY-MM-DD")
+    depreciate.add_argument(
+        "--useful-life-years", required=True, help="使用年限（正整数）"
+    )
+    depreciate.add_argument(
+        "--salvage-rate", required=True, help="残值率（0 到 1 之间两位小数）"
+    )
 
     return parser
 
@@ -71,6 +83,27 @@ def _run_query(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_depreciate(args: argparse.Namespace) -> int:
+    result = depreciate_asset(
+        asset_id=args.asset_id,
+        as_of=args.as_of,
+        useful_life_years=args.useful_life_years,
+        salvage_rate=args.salvage_rate,
+    )
+    line = (
+        "{"
+        f'"asset_id": {json.dumps(result.asset_id)}, '
+        f'"as_of": {json.dumps(result.as_of)}, '
+        f'"purchase_amount": {result.purchase_amount:.2f}, '
+        f'"salvage_value": {result.salvage_value:.2f}, '
+        f'"accumulated_depreciation": {result.accumulated_depreciation:.2f}, '
+        f'"book_value": {result.book_value:.2f}'
+        "}"
+    )
+    print(line)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -80,6 +113,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "register":
             return _run_register(args)
+        if args.command == "depreciate":
+            return _run_depreciate(args)
         return _run_query(args)
     except LedgerError as error:
         print(f"error: {error}", file=sys.stderr)

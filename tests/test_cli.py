@@ -157,5 +157,163 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(self.query_records(), [])
 
 
+class DepreciationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.db_path = Path(self._tmpdir.name) / "asset_ledger.db"
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        env = dict(os.environ, ASSET_LEDGER_DB=str(self.db_path))
+        return subprocess.run(
+            [sys.executable, "-m", "asset_ledger", *arguments],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def register(self, asset_id: str = "A001", amount: str = "8999.00",
+                 purchase_date: str = "2026-09-25") -> None:
+        result = self.invoke(
+            "register",
+            "--asset-id", asset_id,
+            "--name", "电脑",
+            "--category", "办公设备",
+            "--location", "办公室",
+            "--purchase-date", purchase_date,
+            "--purchase-amount", amount,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def depreciate(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            "depreciate",
+            "--asset-id", "A001",
+            "--as-of", "2027-09-25",
+            "--useful-life-years", "5",
+            "--salvage-rate", "0.10",
+            *arguments,
+        )
+
+    def test_documented_example(self) -> None:
+        self.register()
+        result = self.depreciate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        line = json.loads(result.stdout)
+        self.assertEqual(
+            line,
+            {
+                "asset_id": "A001",
+                "as_of": "2027-09-25",
+                "purchase_amount": 8999.00,
+                "salvage_value": 899.90,
+                "accumulated_depreciation": 1619.82,
+                "book_value": 7379.18,
+            },
+        )
+
+    def test_amounts_render_with_two_decimals(self) -> None:
+        self.register()
+        result = self.depreciate()
+        for key in (
+            "purchase_amount",
+            "salvage_value",
+            "accumulated_depreciation",
+            "book_value",
+        ):
+            with self.subTest(key=key):
+                self.assertRegex(result.stdout, rf'"{key}": -?\d+\.\d{{2}}')
+
+    def test_as_of_on_or_before_purchase_date_is_zero(self) -> None:
+        self.register()
+        for as_of in ("2026-09-24", "2026-09-25"):
+            with self.subTest(as_of=as_of):
+                result = self.depreciate("--as-of", as_of)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                line = json.loads(result.stdout)
+                self.assertEqual(line["accumulated_depreciation"], 0.00)
+                self.assertEqual(line["book_value"], 8999.00)
+
+    def test_depreciation_starts_the_day_after_purchase(self) -> None:
+        self.register()
+        result = self.depreciate("--as-of", "2026-09-26")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = json.loads(result.stdout)
+        self.assertEqual(line["accumulated_depreciation"], 4.44)
+        self.assertEqual(line["book_value"], 8994.56)
+
+    def test_depreciation_is_capped_at_end_of_useful_life(self) -> None:
+        self.register()
+        for as_of in ("2031-09-25", "2040-01-01"):
+            with self.subTest(as_of=as_of):
+                result = self.depreciate("--as-of", as_of)
+                line = json.loads(result.stdout)
+                self.assertEqual(line["accumulated_depreciation"], 8099.10)
+                self.assertEqual(line["book_value"], 899.90)
+
+    def test_salvage_rate_endpoints(self) -> None:
+        self.register()
+        zero = self.depreciate("--salvage-rate", "0.00")
+        self.assertEqual(json.loads(zero.stdout)["salvage_value"], 0.00)
+        one = self.depreciate("--salvage-rate", "1.00")
+        line = json.loads(one.stdout)
+        self.assertEqual(line["salvage_value"], 8999.00)
+        self.assertEqual(line["accumulated_depreciation"], 0.00)
+        self.assertEqual(line["book_value"], 8999.00)
+
+    def test_repeated_queries_are_read_only(self) -> None:
+        self.register()
+        first = self.depreciate().stdout
+        second = self.depreciate()
+        self.assertEqual(second.stdout, first)
+        result = self.invoke("query")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(json.loads(result.stdout)["records"]), 1)
+
+    def test_unknown_asset_is_rejected_without_changes(self) -> None:
+        self.register()
+        result = self.depreciate("--asset-id", "NOPE")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertNotEqual(result.stderr, "")
+        records = json.loads(self.invoke("query").stdout)["records"]
+        self.assertEqual([r["asset_id"] for r in records], ["A001"])
+
+    def test_invalid_arguments_are_rejected(self) -> None:
+        self.register()
+        bad_arguments = [
+            ("--as-of", "2027/09/25"),
+            ("--as-of", "2027-13-01"),
+            ("--useful-life-years", "0"),
+            ("--useful-life-years", "-5"),
+            ("--useful-life-years", "5.0"),
+            ("--useful-life-years", "abc"),
+            ("--salvage-rate", "0.1"),
+            ("--salvage-rate", "1.01"),
+            ("--salvage-rate", "-0.10"),
+            ("--salvage-rate", ".10"),
+            ("--salvage-rate", "abc"),
+        ]
+        for override in bad_arguments:
+            with self.subTest(override=override):
+                result = self.depreciate(*override)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                self.assertNotEqual(result.stderr, "")
+        records = json.loads(self.invoke("query").stdout)["records"]
+        self.assertEqual(len(records), 1)
+
+    def test_missing_required_argument_is_an_error(self) -> None:
+        result = self.invoke(
+            "depreciate", "--asset-id", "A001", "--as-of", "2027-09-25"
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotEqual(result.stderr, "")
+        self.assertEqual(result.stdout, "")
+
+
 if __name__ == "__main__":
     unittest.main()
