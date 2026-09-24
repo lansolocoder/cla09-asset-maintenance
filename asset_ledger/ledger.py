@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 import os
 from pathlib import Path
@@ -31,6 +31,18 @@ CREATE TABLE IF NOT EXISTS assets (
 )
 """
 
+_PLAN_SCHEMA = """
+CREATE TABLE IF NOT EXISTS maintenance_plans (
+    asset_id TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    task TEXT NOT NULL,
+    interval_days INTEGER NOT NULL,
+    next_due TEXT NOT NULL,
+    PRIMARY KEY (asset_id, plan_id),
+    FOREIGN KEY (asset_id) REFERENCES assets (asset_id)
+)
+"""
+
 STATUS_IN_USE = "in_use"
 
 
@@ -49,20 +61,38 @@ class Asset:
     status: str
 
 
+@dataclass(frozen=True)
+class MaintenancePlan:
+    asset_id: str
+    plan_id: str
+    task: str
+    interval_days: int
+    next_due: str
+
+
 def _require_non_empty(field: str, value: str) -> str:
     if not value or not value.strip():
         raise LedgerError(f"{field} must not be empty")
     return value
 
 
-def _validate_date(value: str) -> str:
+def _validate_date(value: str, field: str = "purchase date") -> str:
     if not _DATE_RE.fullmatch(value):
-        raise LedgerError(f"purchase date must be in YYYY-MM-DD format: {value!r}")
+        raise LedgerError(f"{field} must be in YYYY-MM-DD format: {value!r}")
     try:
         date.fromisoformat(value)
     except ValueError:
-        raise LedgerError(f"purchase date is not a valid date: {value!r}") from None
+        raise LedgerError(f"{field} is not a valid date: {value!r}") from None
     return value
+
+
+def _validate_interval_days(value: str) -> int:
+    if not re.fullmatch(r"\d+", value):
+        raise LedgerError(f"interval days must be a positive integer: {value!r}")
+    interval_days = int(value)
+    if interval_days <= 0:
+        raise LedgerError(f"interval days must be greater than 0: {value!r}")
+    return interval_days
 
 
 def _validate_amount(value: str) -> Decimal:
@@ -81,6 +111,7 @@ def _validate_amount(value: str) -> Decimal:
 def _connect(db_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(db_path)
     connection.execute(_SCHEMA)
+    connection.execute(_PLAN_SCHEMA)
     return connection
 
 
@@ -93,6 +124,16 @@ def _row_to_asset(row: tuple[str, ...]) -> Asset:
         purchase_date=row[4],
         purchase_amount=Decimal(row[5]),
         status=row[6],
+    )
+
+
+def _row_to_plan(row: tuple[str, ...]) -> MaintenancePlan:
+    return MaintenancePlan(
+        asset_id=row[0],
+        plan_id=row[1],
+        task=row[2],
+        interval_days=row[3],
+        next_due=row[4],
     )
 
 
@@ -162,3 +203,113 @@ def query_assets(
     with _connect(db_path) as connection:
         rows = connection.execute(statement, parameters).fetchall()
     return [_row_to_asset(row) for row in rows]
+
+
+_PLAN_COLUMNS = "asset_id, plan_id, task, interval_days, next_due"
+
+
+def create_plan(
+    asset_id: str,
+    plan_id: str,
+    task: str,
+    interval_days: str,
+    next_due: str,
+    db_path: Path = DB_PATH,
+) -> MaintenancePlan:
+    """Validate and store a maintenance plan; raise LedgerError on any violation."""
+    plan = MaintenancePlan(
+        asset_id=_require_non_empty("asset id", asset_id),
+        plan_id=_require_non_empty("plan id", plan_id),
+        task=_require_non_empty("task", task),
+        interval_days=_validate_interval_days(interval_days),
+        next_due=_validate_date(next_due, "next due date"),
+    )
+    with _connect(db_path) as connection:
+        asset_exists = connection.execute(
+            "SELECT 1 FROM assets WHERE asset_id = ?", (plan.asset_id,)
+        ).fetchone()
+        if asset_exists is None:
+            raise LedgerError(f"asset id not found: {plan.asset_id!r}")
+        duplicate = connection.execute(
+            "SELECT 1 FROM maintenance_plans WHERE asset_id = ? AND plan_id = ?",
+            (plan.asset_id, plan.plan_id),
+        ).fetchone()
+        if duplicate is not None:
+            raise LedgerError(
+                f"plan id already exists for asset {plan.asset_id!r}: {plan.plan_id!r}"
+            )
+        connection.execute(
+            "INSERT INTO maintenance_plans (asset_id, plan_id, task, "
+            "interval_days, next_due) VALUES (?, ?, ?, ?, ?)",
+            (
+                plan.asset_id,
+                plan.plan_id,
+                plan.task,
+                plan.interval_days,
+                plan.next_due,
+            ),
+        )
+    return plan
+
+
+def record_maintenance(
+    asset_id: str,
+    plan_id: str,
+    execution_date: str,
+    db_path: Path = DB_PATH,
+) -> MaintenancePlan:
+    """Record a plan execution and advance next_due; raise LedgerError on conflict."""
+    asset_id = _require_non_empty("asset id", asset_id)
+    plan_id = _require_non_empty("plan id", plan_id)
+    executed_on = date.fromisoformat(
+        _validate_date(execution_date, "execution date")
+    )
+    with _connect(db_path) as connection:
+        row = connection.execute(
+            f"SELECT {_PLAN_COLUMNS} FROM maintenance_plans "
+            "WHERE asset_id = ? AND plan_id = ?",
+            (asset_id, plan_id),
+        ).fetchone()
+        if row is None:
+            raise LedgerError(
+                f"maintenance plan not found for asset {asset_id!r}: {plan_id!r}"
+            )
+        plan = _row_to_plan(row)
+        if executed_on < date.fromisoformat(plan.next_due):
+            raise LedgerError(
+                f"execution date {execution_date} is before next due date "
+                f"{plan.next_due}"
+            )
+        new_due = (executed_on + timedelta(days=plan.interval_days)).isoformat()
+        connection.execute(
+            "UPDATE maintenance_plans SET next_due = ? "
+            "WHERE asset_id = ? AND plan_id = ?",
+            (new_due, asset_id, plan_id),
+        )
+    return MaintenancePlan(
+        asset_id=plan.asset_id,
+        plan_id=plan.plan_id,
+        task=plan.task,
+        interval_days=plan.interval_days,
+        next_due=new_due,
+    )
+
+
+def query_due_plans(
+    query_date: str,
+    db_path: Path = DB_PATH,
+) -> list[tuple[MaintenancePlan, int]]:
+    """Return (plan, overdue_days) for plans due on or before the query date."""
+    query_on = date.fromisoformat(_validate_date(query_date, "query date"))
+    with _connect(db_path) as connection:
+        rows = connection.execute(
+            f"SELECT {_PLAN_COLUMNS} FROM maintenance_plans "
+            "WHERE next_due <= ? ORDER BY asset_id ASC, plan_id ASC",
+            (query_date,),
+        ).fetchall()
+    results: list[tuple[MaintenancePlan, int]] = []
+    for row in rows:
+        plan = _row_to_plan(row)
+        overdue_days = (query_on - date.fromisoformat(plan.next_due)).days
+        results.append((plan, overdue_days))
+    return results
