@@ -2,3 +2,5 @@ __pycache__/
 *.py[cod]
 .venv/
 .DS_Store
+.asset_ledger.db
+*.db
