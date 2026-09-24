@@ -1,8 +1,11 @@
 """Checks for the documented command-line entry point."""
 
+import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 
 
@@ -39,6 +42,119 @@ class CommandLineTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--unknown-option", result.stderr)
         self.assertEqual(result.stdout, "")
+
+
+class LedgerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.db_path = Path(self._tmpdir.name) / "asset_ledger.db"
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        env = dict(os.environ, ASSET_LEDGER_DB=str(self.db_path))
+        return subprocess.run(
+            [sys.executable, "-m", "asset_ledger", *arguments],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def register(self, asset_id: str, **overrides: str) -> subprocess.CompletedProcess[str]:
+        fields = {
+            "asset-id": asset_id,
+            "name": "示波器",
+            "category": "仪器",
+            "location": "实验室B",
+            "purchase-date": "2026-09-25",
+            "purchase-amount": "123.40",
+        }
+        fields.update(overrides)
+        arguments = ["register"]
+        for key, value in fields.items():
+            arguments += [f"--{key}", value]
+        return self.invoke(*arguments)
+
+    def query_records(self, *arguments: str) -> list[dict[str, object]]:
+        result = self.invoke("query", *arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        return json.loads(result.stdout)["records"]
+
+    def test_register_and_query_round_trip(self) -> None:
+        result = self.register("A002")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = json.loads(result.stdout)
+        self.assertEqual(line, {"asset_id": "A002", "name": "示波器", "status": "in_use"})
+
+        self.register("A001", name="电脑", category="办公设备", **{"purchase-amount": "8999"})
+        records = self.query_records()
+        self.assertEqual([r["asset_id"] for r in records], ["A001", "A002"])
+        self.assertEqual(records[0]["status"], "in_use")
+        self.assertEqual(records[0]["purchase_date"], "2026-09-25")
+        self.assertIsInstance(records[0]["purchase_amount"], float)
+        self.assertEqual(records[0]["purchase_amount"], 8999.00)
+        self.assertEqual(records[1]["purchase_amount"], 123.40)
+        self.assertIn('"purchase_amount": 8999.00', self.invoke("query").stdout)
+
+    def test_query_filters_intersect(self) -> None:
+        self.register("A001", location="实验室A")
+        self.register("A002", category="办公设备")
+        self.register("A003")
+        self.assertEqual(
+            [r["asset_id"] for r in self.query_records("--category", "仪器")],
+            ["A001", "A003"],
+        )
+        self.assertEqual(
+            [
+                r["asset_id"]
+                for r in self.query_records("--category", "仪器", "--location", "实验室A")
+            ],
+            ["A001"],
+        )
+        self.assertEqual(self.query_records("--category", "不存在"), [])
+
+    def test_duplicate_asset_id_is_rejected(self) -> None:
+        self.assertEqual(self.register("A001").returncode, 0)
+        result = self.register("A001", name="另一台")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotEqual(result.stderr, "")
+        self.assertEqual(result.stdout, "")
+        records = self.query_records()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["name"], "示波器")
+
+    def test_invalid_input_is_rejected_without_changes(self) -> None:
+        bad_calls = [
+            {"asset_id": "", },
+            {"name": ""},
+            {"category": ""},
+            {"location": ""},
+            {"purchase-date": "2026/09/25"},
+            {"purchase-date": "2026-13-01"},
+            {"purchase-amount": "-1"},
+            {"purchase-amount": "1.234"},
+            {"purchase-amount": "abc"},
+        ]
+        for overrides in bad_calls:
+            with self.subTest(overrides=overrides):
+                translated = {
+                    {"asset_id": "asset-id"}.get(k, k).replace("_", "-"): v
+                    for k, v in overrides.items()
+                }
+                result = self.register("A001", **translated)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotEqual(result.stderr, "")
+                self.assertEqual(result.stdout, "")
+        self.assertEqual(self.query_records(), [])
+
+    def test_missing_required_argument_is_an_error(self) -> None:
+        result = self.invoke("register", "--asset-id", "A001", "--name", "x")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotEqual(result.stderr, "")
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.query_records(), [])
 
 
 if __name__ == "__main__":
