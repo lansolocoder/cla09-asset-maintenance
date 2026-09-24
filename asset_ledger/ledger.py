@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import os
 from pathlib import Path
 import re
@@ -18,6 +18,7 @@ DB_PATH = Path(
 
 _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _AMOUNT_RE = re.compile(r"\d+(\.\d{1,2})?")
+_SALVAGE_RATE_RE = re.compile(r"(0|1)\.\d{2}")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS assets (
@@ -162,3 +163,91 @@ def query_assets(
     with _connect(db_path) as connection:
         rows = connection.execute(statement, parameters).fetchall()
     return [_row_to_asset(row) for row in rows]
+
+
+def get_asset(asset_id: str, db_path: Path = DB_PATH) -> Asset:
+    """Return the asset with the given id; raise LedgerError if it does not exist."""
+    with _connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT asset_id, name, category, location, purchase_date, "
+            "purchase_amount, status FROM assets WHERE asset_id = ?",
+            (asset_id,),
+        ).fetchone()
+    if row is None:
+        raise LedgerError(f"asset id not found: {asset_id!r}")
+    return _row_to_asset(row)
+
+
+def _validate_depreciation_date(value: str) -> date:
+    if not _DATE_RE.fullmatch(value):
+        raise LedgerError(f"as-of date must be in YYYY-MM-DD format: {value!r}")
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise LedgerError(f"as-of date is not a valid date: {value!r}") from None
+
+
+def _validate_useful_life_years(value: str) -> int:
+    if not value.isdigit() or int(value) <= 0:
+        raise LedgerError(
+            f"useful life years must be a positive integer: {value!r}"
+        )
+    return int(value)
+
+
+def _validate_salvage_rate(value: str) -> Decimal:
+    if not _SALVAGE_RATE_RE.fullmatch(value):
+        raise LedgerError(
+            "salvage rate must be a decimal number between 0 and 1 with "
+            f"exactly two fraction digits: {value!r}"
+        )
+    rate = Decimal(value)
+    if not Decimal(0) <= rate <= Decimal(1):
+        raise LedgerError(
+            f"salvage rate must be between 0 and 1 inclusive: {value!r}"
+        )
+    return rate
+
+
+def calculate_depreciation(
+    asset: Asset,
+    as_of: str,
+    useful_life_years: str,
+    salvage_rate: str,
+) -> dict[str, object]:
+    """Straight-line depreciation of one asset from purchase day after to as-of.
+
+    Depreciation accrues from the day after the purchase date through the
+    as-of date, counted in calendar days. It is capped at the depreciable
+    amount once the useful life has been exceeded.
+    """
+    end_date = _validate_depreciation_date(as_of)
+    life_years = _validate_useful_life_years(useful_life_years)
+    rate = _validate_salvage_rate(salvage_rate)
+
+    purchase_date = date.fromisoformat(asset.purchase_date)
+    purchase_amount = asset.purchase_amount
+    total_life_days = life_years * 365
+    used_days = (end_date - purchase_date).days
+    if used_days < 0:
+        used_days = 0
+    if used_days > total_life_days:
+        used_days = total_life_days
+
+    salvage_value = (purchase_amount * rate).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    depreciable_amount = purchase_amount - salvage_value
+    depreciation = (
+        depreciable_amount * Decimal(used_days) / Decimal(total_life_days)
+    ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    book_value = purchase_amount - depreciation
+
+    return {
+        "asset_id": asset.asset_id,
+        "as_of": as_of,
+        "purchase_amount": purchase_amount,
+        "salvage_value": salvage_value,
+        "accumulated_depreciation": depreciation,
+        "book_value": book_value,
+    }
