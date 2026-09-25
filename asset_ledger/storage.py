@@ -1,4 +1,4 @@
-"""sqlite3 本地持久化层：资产登记、位置变更与查询。
+"""sqlite3 本地持久化层：资产登记、位置变更、维保计划与查询。
 
 所有写入在单个事务内完成，要么整体成功，要么整体不生效；
 日期与金额均按输入字符串原样保存，不做转换或四舍五入。
@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 import sqlite3
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import NamedTuple
 
@@ -35,6 +35,10 @@ class AssetNotFound(LedgerError):
 
 class DuplicateAsset(LedgerError):
     """资产编号重复登记。"""
+
+
+class DuplicatePlan(LedgerError):
+    """维保计划编号重复登记。"""
 
 
 @dataclass(frozen=True)
@@ -72,6 +76,34 @@ class MoveResult(NamedTuple):
     location: str
 
 
+@dataclass(frozen=True)
+class MaintenancePlan:
+    """一条维保计划：按资产列出时使用。"""
+
+    plan_id: str
+    asset_id: str
+    plan_type: str
+    first_due_date: str
+    period_days: int
+
+
+@dataclass(frozen=True)
+class DuePlan:
+    """到期待办清单中的一条：计划信息、下一次到期日期与资产当前存放位置。"""
+
+    plan_id: str
+    asset_id: str
+    plan_type: str
+    next_due_date: str
+    current_location: str
+
+
+class PlanRegisterResult(NamedTuple):
+    plan_id: str
+    asset_id: str
+    first_due_date: str
+
+
 def _validate_required(value: str, field: str) -> str:
     if value is None or not value.strip():
         raise LedgerError(f"{field}不能为空")
@@ -92,6 +124,13 @@ def _validate_cost(value: str) -> str:
     if not MONEY_RE.match(value):
         raise LedgerError(f"购置金额必须是以元计的非负十进制数：{value!r}")
     return value
+
+
+def _validate_period_days(value: str) -> int:
+    # 正整数：仅由数字组成且大于 0；拒绝 0、负数、小数与非数字内容。
+    if not value or not value.isdigit() or int(value) <= 0:
+        raise LedgerError(f"周期天数必须是正整数：{value!r}")
+    return int(value)
 
 
 def _validate_location(value: str) -> str:
@@ -133,6 +172,19 @@ def init_db(db_path: Path) -> None:
 
             CREATE INDEX IF NOT EXISTS idx_location_history_asset
                 ON location_history(asset_id, chronology);
+
+            CREATE TABLE IF NOT EXISTS maintenance_plans (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                plan_id         TEXT NOT NULL UNIQUE,
+                asset_id        TEXT NOT NULL,
+                plan_type       TEXT NOT NULL,
+                first_due_date  TEXT NOT NULL,
+                period_days     INTEGER NOT NULL,
+                FOREIGN KEY (asset_id) REFERENCES assets(asset_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_maintenance_plans_asset
+                ON maintenance_plans(asset_id, first_due_date, id);
             """
         )
 
@@ -278,3 +330,138 @@ def get_asset(db_path: Path, *, asset_id: str) -> AssetView:
         current_location=current_location,
         history=history,
     )
+
+
+def register_plan(
+    db_path: Path,
+    *,
+    plan_id: str,
+    asset_id: str,
+    plan_type: str,
+    first_due_date: str,
+    period_days: str,
+) -> PlanRegisterResult:
+    """为已登记资产登记一条维保计划（历史只增不改，不提供修改或删除）。
+
+    全部校验通过后才写入；计划编号重复或资产未登记时事务回滚，
+    不会写入半条记录，也不会顺带创建资产或改动既有计划。
+    """
+    plan_id = _validate_required(plan_id, "计划编号")
+    asset_id = _validate_required(asset_id, "资产编号")
+    plan_type = _validate_required(plan_type, "维保类型")
+    first_due_date = _validate_date(first_due_date, "首次到期日期")
+    period = _validate_period_days(period_days)
+
+    conn = _connect(db_path)
+    try:
+        with conn:
+            asset_row = conn.execute(
+                "SELECT 1 FROM assets WHERE asset_id = ?", (asset_id,)
+            ).fetchone()
+            if asset_row is None:
+                raise AssetNotFound(f"资产编号未登记：{asset_id}")
+
+            cursor = conn.execute(
+                "INSERT INTO maintenance_plans "
+                "(plan_id, asset_id, plan_type, first_due_date, period_days) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(plan_id) DO NOTHING",
+                (plan_id, asset_id, plan_type, first_due_date, period),
+            )
+            if cursor.rowcount == 0:
+                raise DuplicatePlan(f"维保计划编号已存在：{plan_id}")
+    finally:
+        conn.close()
+    return PlanRegisterResult(plan_id, asset_id, first_due_date)
+
+
+def list_plans(db_path: Path, *, asset_id: str) -> tuple[MaintenancePlan, ...]:
+    """按资产编号列出其全部维保计划。
+
+    按首次到期日期升序、同一日期按录入顺序排列；资产未登记时报错。
+    """
+    asset_id = _validate_required(asset_id, "资产编号")
+    conn = _connect(db_path)
+    try:
+        asset_row = conn.execute(
+            "SELECT 1 FROM assets WHERE asset_id = ?", (asset_id,)
+        ).fetchone()
+        if asset_row is None:
+            raise AssetNotFound(f"资产编号未登记：{asset_id}")
+        rows = conn.execute(
+            "SELECT plan_id, asset_id, plan_type, first_due_date, period_days "
+            "FROM maintenance_plans WHERE asset_id = ? "
+            "ORDER BY first_due_date, id",
+            (asset_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return tuple(
+        MaintenancePlan(
+            plan_id=r[0],
+            asset_id=r[1],
+            plan_type=r[2],
+            first_due_date=r[3],
+            period_days=r[4],
+        )
+        for r in rows
+    )
+
+
+def _next_due_date(first_due: date, period_days: int, cutoff: date) -> date | None:
+    """推算截止日（含）之前最近一次到期日期；首次到期已晚于截止日则返回 None。"""
+    if first_due > cutoff:
+        return None
+    elapsed = (cutoff - first_due).days
+    k = elapsed // period_days
+    return first_due + timedelta(days=k * period_days)
+
+
+def due_plans(db_path: Path, *, cutoff_date: str) -> tuple[DuePlan, ...]:
+    """列出下一次到期日期早于或等于截止日期的全部计划（含恰好相等）。
+
+    按到期日期升序、同一日期按录入顺序排列；每条附带资产当前存放位置。
+    已登记但尚未到期的计划不在清单中，不属于错误。
+    """
+    cutoff_text = _validate_date(cutoff_date, "截止日期")
+    cutoff = date.fromisoformat(cutoff_text)
+
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT p.plan_id, p.asset_id, p.plan_type,
+                   p.first_due_date, p.period_days,
+                   (SELECT l.location FROM location_history l
+                     WHERE l.asset_id = p.asset_id
+                     ORDER BY l.chronology DESC LIMIT 1) AS current_location
+            FROM maintenance_plans p
+            ORDER BY p.id
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    due: list[tuple[int, DuePlan]] = []
+    for entry_order, row in enumerate(rows):
+        plan_id, asset_id, plan_type, first_text, period_days, location = row
+        next_due = _next_due_date(
+            date.fromisoformat(first_text), period_days, cutoff
+        )
+        if next_due is None:
+            continue
+        due.append(
+            (
+                entry_order,
+                DuePlan(
+                    plan_id=plan_id,
+                    asset_id=asset_id,
+                    plan_type=plan_type,
+                    next_due_date=next_due.isoformat(),
+                    current_location=location or "",
+                ),
+            )
+        )
+
+    due.sort(key=lambda item: (item[1].next_due_date, item[0]))
+    return tuple(item[1] for item in due)

@@ -244,6 +244,246 @@ class LedgerCliTests(unittest.TestCase):
         self.assertEqual(shown.stdout.count("[初始]"), 1)
         self.assertNotIn("[变更]", shown.stdout)
 
+    # ---- 维保计划登记 --------------------------------------------------
+
+    def plan_register(
+        self,
+        plan_id: str = "P001",
+        asset_id: str = "A001",
+        plan_type: str = "常规保养",
+        first_due_date: str = "2026-06-30",
+        period_days: str = "90",
+    ) -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            "plan-register",
+            "--plan-id", plan_id,
+            "--asset-id", asset_id,
+            "--type", plan_type,
+            "--first-due-date", first_due_date,
+            "--period-days", period_days,
+        )
+
+    def test_plan_register_success_output(self) -> None:
+        self.register()
+        result = self.plan_register()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("计划编号: P001", result.stdout)
+        self.assertIn("资产编号: A001", result.stdout)
+        self.assertIn("首次到期日期: 2026-06-30", result.stdout)
+        self.assertEqual(result.stderr, "")
+
+    def test_duplicate_plan_id_fails_and_keeps_original(self) -> None:
+        self.register()
+        first = self.plan_register(
+            "P001", plan_type="常规保养", first_due_date="2026-06-30", period_days="90"
+        )
+        self.assertEqual(first.returncode, 0, first.stderr)
+
+        second = self.plan_register(
+            "P001", plan_type="年度大修", first_due_date="2027-01-01", period_days="365"
+        )
+        self.assertNotEqual(second.returncode, 0)
+        self.assertIn("已存在", second.stderr)
+        self.assertEqual(second.stdout, "")
+
+        listed = self.invoke("plan-list", "--asset-id", "A001")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertEqual(listed.stdout.count("计划编号: P001"), 1)
+        self.assertIn("常规保养", listed.stdout)
+        self.assertIn("2026-06-30", listed.stdout)
+        self.assertIn("周期天数: 90", listed.stdout)
+        self.assertNotIn("年度大修", listed.stdout)
+        self.assertNotIn("2027-01-01", listed.stdout)
+        self.assertNotIn("365", listed.stdout)
+
+    def test_plan_register_unknown_asset_does_not_create_asset(self) -> None:
+        result = self.plan_register("P002", asset_id="GHOST")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("未登记", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+        shown = self.invoke("show", "--id", "GHOST")
+        self.assertNotEqual(shown.returncode, 0)
+        listed = self.invoke("plan-list", "--asset-id", "GHOST")
+        self.assertNotEqual(listed.returncode, 0)
+
+    def test_plan_register_rejects_bad_dates(self) -> None:
+        self.register()
+        for bad in ["2026/06/30", "2026-6-30", "20260630", "2026-13-01", "2026-02-30"]:
+            with self.subTest(bad=bad):
+                result = self.plan_register("PBAD", first_due_date=bad)
+                self.assertNotEqual(result.returncode, 0, bad)
+                self.assertIn("日期", result.stderr)
+        listed = self.invoke("plan-list", "--asset-id", "A001")
+        self.assertNotIn("PBAD", listed.stdout)
+
+    def test_plan_register_rejects_non_positive_integer_period(self) -> None:
+        self.register()
+        for bad in ["0", "-3", "1.5", "abc", "", "1e2", "+1"]:
+            with self.subTest(bad=bad):
+                result = self.invoke(
+                    "plan-register",
+                    "--plan-id", "PPER",
+                    "--asset-id", "A001",
+                    "--type", "保养",
+                    "--first-due-date", "2026-06-30",
+                    "--period-days", bad,
+                )
+                self.assertNotEqual(result.returncode, 0, repr(bad))
+                self.assertIn("周期天数", result.stderr)
+        listed = self.invoke("plan-list", "--asset-id", "A001")
+        self.assertNotIn("PPER", listed.stdout)
+
+    def test_multiple_plans_same_asset_are_append_only(self) -> None:
+        self.register()
+        self.assertEqual(self.plan_register("P001").returncode, 0)
+        second = self.plan_register("P002", plan_type="年度巡检", period_days="365")
+        self.assertEqual(second.returncode, 0, second.stderr)
+
+        listed = self.invoke("plan-list", "--asset-id", "A001")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertEqual(listed.stdout.count("计划编号:"), 2)
+
+    # ---- 按资产列出维保计划 --------------------------------------------
+
+    def test_plan_list_ordering_by_date_then_entry_order(self) -> None:
+        self.register()
+        # 先录入晚到期的计划，再录入早到期的计划，验证按日期重排。
+        self.plan_register("P002", plan_type="年度巡检", first_due_date="2026-12-31", period_days="365")
+        self.plan_register("P001", plan_type="常规保养", first_due_date="2026-06-30", period_days="90")
+        # 与 P001 同日但更晚录入，应排在 P001 之后。
+        self.plan_register("P003", plan_type="安全检查", first_due_date="2026-06-30", period_days="30")
+
+        listed = self.invoke("plan-list", "--asset-id", "A001")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        blocks = [
+            line for line in listed.stdout.splitlines() if "计划编号:" in line
+        ]
+        self.assertEqual(blocks, ["  计划编号: P001", "  计划编号: P003", "  计划编号: P002"])
+        self.assertIn("维保类型: 常规保养", listed.stdout)
+        self.assertIn("首次到期日期: 2026-06-30", listed.stdout)
+        self.assertIn("周期天数: 90", listed.stdout)
+
+    def test_plan_list_unknown_asset_fails_on_stderr(self) -> None:
+        result = self.invoke("plan-list", "--asset-id", "MISSING")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("未登记", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_plan_list_empty_for_asset_without_plans(self) -> None:
+        self.register()
+        result = self.invoke("plan-list", "--asset-id", "A001")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("无记录", result.stdout)
+
+    # ---- 到期待办清单 --------------------------------------------------
+
+    def test_dues_includes_due_plans_with_next_date_and_location(self) -> None:
+        self.register(location="北京办公室")
+        self.invoke("move", "--id", "A001", "--location", "上海分部", "--date", "2026-03-01")
+        # 首次 2026-03-02，周期 30 天；截止 2026-04-01，下一次到期恰为 2026-04-01。
+        self.plan_register(
+            "P001", plan_type="常规保养", first_due_date="2026-03-02", period_days="30"
+        )
+        result = self.invoke("dues", "--cutoff-date", "2026-04-01")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("计划编号: P001", result.stdout)
+        self.assertIn("资产编号: A001", result.stdout)
+        self.assertIn("维保类型: 常规保养", result.stdout)
+        self.assertIn("下一次到期日期: 2026-04-01", result.stdout)
+        self.assertIn("当前存放位置: 上海分部", result.stdout)
+
+    def test_dues_excludes_not_yet_due_plans(self) -> None:
+        self.register()
+        self.plan_register(
+            "P001", plan_type="常规保养", first_due_date="2026-06-30", period_days="90"
+        )
+        result = self.invoke("dues", "--cutoff-date", "2026-06-29")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("P001", result.stdout)
+        self.assertIn("无到期计划", result.stdout)
+
+    def test_dues_inclusive_on_cutoff_date(self) -> None:
+        self.register()
+        self.plan_register(
+            "P001", plan_type="常规保养", first_due_date="2026-06-30", period_days="90"
+        )
+        result = self.invoke("dues", "--cutoff-date", "2026-06-30")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("下一次到期日期: 2026-06-30", result.stdout)
+
+    def test_dues_picks_latest_occurrence_before_cutoff(self) -> None:
+        self.register()
+        # 首次 2026-01-01，周期 30 天：01-01, 01-31, 03-02, 04-01 ...
+        self.plan_register(
+            "P001", plan_type="保养", first_due_date="2026-01-01", period_days="30"
+        )
+        result = self.invoke("dues", "--cutoff-date", "2026-03-15")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("下一次到期日期: 2026-03-02", result.stdout)
+
+    def test_dues_ordering_by_due_date_then_entry_order(self) -> None:
+        self.register("A001", location="北京办公室")
+        self.register("A002", location="上海仓库")
+        # P002 录入在前但到期更晚；P001 录入在后但到期更早。
+        self.plan_register(
+            "P002", asset_id="A002", plan_type="年检",
+            first_due_date="2026-01-10", period_days="40",
+        )
+        self.plan_register(
+            "P001", asset_id="A001", plan_type="月检",
+            first_due_date="2026-01-01", period_days="30",
+        )
+        # P003 与 P001 下次到期同为 2026-01-01（周期 20 天，下一期 01-21 超出），但录入更晚。
+        self.plan_register(
+            "P003", asset_id="A001", plan_type="巡检",
+            first_due_date="2026-01-01", period_days="20",
+        )
+
+        result = self.invoke("dues", "--cutoff-date", "2026-01-20")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # P001 与 P003 下次到期均为 01-01，按录入顺序 P001 在前；P002 为 01-10。
+        plan_lines = [
+            line for line in result.stdout.splitlines() if "计划编号:" in line
+        ]
+        self.assertEqual(
+            plan_lines,
+            ["  计划编号: P001", "  计划编号: P003", "  计划编号: P002"],
+        )
+
+    def test_dues_rejects_bad_cutoff_date(self) -> None:
+        for bad in ["2026/01/01", "2026-13-01", "not-a-date"]:
+            with self.subTest(bad=bad):
+                result = self.invoke("dues", "--cutoff-date", bad)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("日期", result.stderr)
+
+    # ---- 维保计划失败可重试 --------------------------------------------
+
+    def test_plan_failure_then_retry_is_equivalent_to_clean_success(self) -> None:
+        self.register()
+        bad1 = self.plan_register("F001", asset_id="GHOST")
+        bad2 = self.invoke(
+            "plan-register",
+            "--plan-id", "F001", "--asset-id", "A001",
+            "--type", "保养",
+            "--first-due-date", "2026-06-30", "--period-days", "0",
+        )
+        bad3 = self.plan_register("F001", first_due_date="2026-02-30")
+        self.assertNotEqual(bad1.returncode, 0)
+        self.assertNotEqual(bad2.returncode, 0)
+        self.assertNotEqual(bad3.returncode, 0)
+
+        good = self.plan_register(
+            "F001", plan_type="常规保养", first_due_date="2026-06-30", period_days="90"
+        )
+        self.assertEqual(good.returncode, 0, good.stderr)
+
+        listed = self.invoke("plan-list", "--asset-id", "A001")
+        self.assertEqual(listed.stdout.count("计划编号: F001"), 1)
+        self.assertIn("常规保养", listed.stdout)
+        self.assertIn("周期天数: 90", listed.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
