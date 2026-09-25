@@ -24,6 +24,7 @@ from .storage import (
     MoveResult,
     PlanRegisterResult,
     RegisterResult,
+    ScrapResult,
 )
 
 
@@ -46,6 +47,12 @@ def _print_register_result(result: RegisterResult) -> None:
 def _print_move_result(result: MoveResult) -> None:
     print(f"资产编号: {result.asset_id}")
     print(f"当前存放位置: {result.location}")
+
+
+def _print_scrap_result(result: ScrapResult) -> None:
+    print(f"资产编号: {result.asset_id}")
+    print(f"状态: {result.status}")
+    print(f"报废日期: {result.scrap_date}")
 
 
 def _print_history(history: Sequence[LocationRecord]) -> None:
@@ -149,6 +156,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     move_parser.set_defaults(handler=_handle_move)
 
+    scrap_parser = subparsers.add_parser(
+        "scrap", help="登记在用资产报废（追加报废记录，只增不改）"
+    )
+    _add_db_argument(scrap_parser, suppress=True)
+    scrap_parser.add_argument("--id", dest="asset_id", required=True, help="资产编号")
+    scrap_parser.add_argument(
+        "--date", dest="scrap_date", required=True, help="报废日期，格式 YYYY-MM-DD"
+    )
+    scrap_parser.add_argument("--reason", required=True, help="报废原因（不能为空）")
+    scrap_parser.add_argument(
+        "--request-id",
+        dest="request_id",
+        default=None,
+        help="可选请求编号（非空字符串），作为重复提交的幂等键",
+    )
+    scrap_parser.set_defaults(handler=_handle_scrap)
+
     show_parser = subparsers.add_parser(
         "show", help="按资产编号查询资产信息与完整位置变更历史"
     )
@@ -233,6 +257,20 @@ def _handle_move(args: argparse.Namespace) -> int:
         change_date=args.change_date,
     )
     _print_move_result(result)
+    return 0
+
+
+def _handle_scrap(args: argparse.Namespace) -> int:
+    db_path = _resolve_db_path(args)
+    storage.init_db(db_path)
+    result = storage.scrap(
+        db_path,
+        asset_id=args.asset_id,
+        scrap_date=args.scrap_date,
+        reason=args.reason,
+        request_id=args.request_id,
+    )
+    _print_scrap_result(result)
     return 0
 
 

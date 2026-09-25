@@ -23,6 +23,7 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 MONEY_RE = re.compile(r"^\+?\d+(?:\.\d+)?$")
 
 STATUS_IN_USE = "在用"
+STATUS_SCRAPPED = "已报废"
 
 
 class LedgerError(ValueError):
@@ -31,6 +32,10 @@ class LedgerError(ValueError):
 
 class AssetNotFound(LedgerError):
     """对未登记的资产编号执行操作。"""
+
+
+class AssetScrapped(LedgerError):
+    """对已报废资产执行仅“在用”状态允许的操作（重复报废、位置变更、维保登记）。"""
 
 
 class DuplicateAsset(LedgerError):
@@ -102,6 +107,12 @@ class PlanRegisterResult(NamedTuple):
     plan_id: str
     asset_id: str
     first_due_date: str
+
+
+class ScrapResult(NamedTuple):
+    asset_id: str
+    status: str
+    scrap_date: str
 
 
 def _validate_required(value: str, field: str) -> str:
@@ -185,6 +196,21 @@ def init_db(db_path: Path) -> None:
 
             CREATE INDEX IF NOT EXISTS idx_maintenance_plans_asset
                 ON maintenance_plans(asset_id, first_due_date, id);
+
+            CREATE TABLE IF NOT EXISTS scrap_records (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset_id   TEXT NOT NULL UNIQUE,
+                scrap_date TEXT NOT NULL,
+                reason     TEXT NOT NULL,
+                FOREIGN KEY (asset_id) REFERENCES assets(asset_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS scrap_requests (
+                request_id TEXT PRIMARY KEY,
+                asset_id   TEXT NOT NULL,
+                scrap_date TEXT NOT NULL,
+                reason     TEXT NOT NULL
+            );
             """
         )
 
@@ -243,6 +269,7 @@ def move(
 ) -> MoveResult:
     """对已登记资产追加一条位置变更记录（历史只增不改）。
 
+    仅状态为“在用”的资产可以变更；已报废资产直接拒绝，不写任何记录。
     变更日期不得早于该设备的购置日期，也不得早于最后一条位置记录的日期；
     资产不存在时直接拒绝，不创建资产也不写位置记录。
     同一日期允许多次变更，按录入顺序排列。
@@ -255,12 +282,14 @@ def move(
     try:
         with conn:
             row = conn.execute(
-                "SELECT purchase_date FROM assets WHERE asset_id = ?",
+                "SELECT purchase_date, status FROM assets WHERE asset_id = ?",
                 (asset_id,),
             ).fetchone()
             if row is None:
                 raise AssetNotFound(f"资产编号未登记：{asset_id}")
-            purchase_date = row[0]
+            purchase_date, status = row
+            if status == STATUS_SCRAPPED:
+                raise AssetScrapped(f"资产已报废，不能变更存放位置：{asset_id}")
 
             last = conn.execute(
                 "SELECT date FROM location_history "
@@ -332,6 +361,88 @@ def get_asset(db_path: Path, *, asset_id: str) -> AssetView:
     )
 
 
+def scrap(
+    db_path: Path,
+    *,
+    asset_id: str,
+    scrap_date: str,
+    reason: str,
+    request_id: str | None = None,
+) -> ScrapResult:
+    """登记资产报废：状态置为“已报废”并追加一条报废记录（只增不改）。
+
+    仅状态为“在用”的资产可以报废；报废日期不得早于最后一条位置记录的日期。
+    request_id 为可选幂等键：同一数据文件内相同请求编号且资产编号、报废日期、
+    报废原因完全一致时视为重复提交，保持成功且不再追加记录；任一参数与首次
+    不同则拒绝。全部校验在同一事务内完成，失败时整体不生效。
+    """
+    asset_id = _validate_required(asset_id, "资产编号")
+    scrap_date = _validate_date(scrap_date, "报废日期")
+    reason = _validate_required(reason, "报废原因")
+    if request_id is not None:
+        request_id = _validate_required(request_id, "请求编号")
+
+    conn = _connect(db_path)
+    try:
+        with conn:
+            # 幂等命中优先于资产状态判断：已成功的重复提交必须保持成功。
+            if request_id is not None:
+                existing = conn.execute(
+                    "SELECT asset_id, scrap_date, reason FROM scrap_requests "
+                    "WHERE request_id = ?",
+                    (request_id,),
+                ).fetchone()
+                if existing is not None:
+                    if tuple(existing) != (asset_id, scrap_date, reason):
+                        raise LedgerError(
+                            f"请求编号 {request_id} 已用于另一次报废登记，"
+                            "资产编号、报废日期与报废原因必须与首次提交完全一致"
+                        )
+                    stored = conn.execute(
+                        "SELECT scrap_date FROM scrap_records WHERE asset_id = ?",
+                        (asset_id,),
+                    ).fetchone()
+                    return ScrapResult(asset_id, STATUS_SCRAPPED, stored[0])
+
+            row = conn.execute(
+                "SELECT status FROM assets WHERE asset_id = ?", (asset_id,)
+            ).fetchone()
+            if row is None:
+                raise AssetNotFound(f"资产编号未登记：{asset_id}")
+            if row[0] == STATUS_SCRAPPED:
+                raise AssetScrapped(f"资产已报废，不能重复报废：{asset_id}")
+
+            last = conn.execute(
+                "SELECT date FROM location_history "
+                "WHERE asset_id = ? ORDER BY chronology DESC LIMIT 1",
+                (asset_id,),
+            ).fetchone()
+            if last is not None and scrap_date < last[0]:
+                raise LedgerError(
+                    f"报废日期 {scrap_date} 早于最后一条位置记录日期 {last[0]}，"
+                    "拒绝报废"
+                )
+
+            conn.execute(
+                "INSERT INTO scrap_records (asset_id, scrap_date, reason) "
+                "VALUES (?, ?, ?)",
+                (asset_id, scrap_date, reason),
+            )
+            conn.execute(
+                "UPDATE assets SET status = ? WHERE asset_id = ?",
+                (STATUS_SCRAPPED, asset_id),
+            )
+            if request_id is not None:
+                conn.execute(
+                    "INSERT INTO scrap_requests "
+                    "(request_id, asset_id, scrap_date, reason) VALUES (?, ?, ?, ?)",
+                    (request_id, asset_id, scrap_date, reason),
+                )
+    finally:
+        conn.close()
+    return ScrapResult(asset_id, STATUS_SCRAPPED, scrap_date)
+
+
 def register_plan(
     db_path: Path,
     *,
@@ -356,10 +467,12 @@ def register_plan(
     try:
         with conn:
             asset_row = conn.execute(
-                "SELECT 1 FROM assets WHERE asset_id = ?", (asset_id,)
+                "SELECT status FROM assets WHERE asset_id = ?", (asset_id,)
             ).fetchone()
             if asset_row is None:
                 raise AssetNotFound(f"资产编号未登记：{asset_id}")
+            if asset_row[0] == STATUS_SCRAPPED:
+                raise AssetScrapped(f"资产已报废，不能登记维保计划：{asset_id}")
 
             cursor = conn.execute(
                 "INSERT INTO maintenance_plans "
