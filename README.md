@@ -65,4 +65,25 @@ python3 -m asset_ledger depreciation-summary --month 2026-09
 
 totals 固定含 `total_monthly`、`total_accumulated`、`total_net_book_value` 三个两位小数数字。台账为空时 records 为空数组、totals 各值为 `0.00`，退出码仍为 0。`--month` 非法时退出码非 0、错误写 stderr、stdout 无输出。汇总为只读操作，不修改台账中的任何字段，也不影响其他命令的输出。
 
+## 维修工单
+
+```bash
+# 登记工单
+python3 -m asset_ledger register-ticket \
+    --ticket-id T001 --asset-id A001 \
+    --fault-description 无法开机 --submitted-date 2026-09-26
+
+# 完成工单
+python3 -m asset_ledger complete-ticket --ticket-id T001 --completed-date 2026-09-28
+
+# 按资产列出工单
+python3 -m asset_ledger list-tickets --asset-id A001
+```
+
+登记工单的必填输入为工单号、资产编号、故障描述、送修日期。工单号是业务唯一键，重复登记同一工单号整体失败（退出码非 0、错误写 stderr、stdout 无输出），已有工单保持不变。送修日期必须是合法的 `YYYY-MM-DD` 且不得早于该资产的购置日期，否则整体失败且不产生任何记录；晚于当天的送修日期按原值保存，不视为错误。故障描述不得为空；资产不存在时失败且不产生记录。登记成功退出码 0，stdout 输出一行 JSON：`{"asset_id": "A001", "ticket_id": "T001", "status": "submitted"}`，工单初始状态为 `submitted`。
+
+完成工单以工单号与完成日期（合法 `YYYY-MM-DD`，不得早于送修日期）为输入，成功后状态变为 `completed` 并保存完成日期，stdout 输出一行 JSON：`{"ticket_id": "T001", "status": "completed"}`。已完成工单再次完成视为错误（退出码非 0、错误写 stderr、stdout 无输出），工单保持 `completed` 且完成日期不变；也不允许再次登记同工单号覆盖。任一失败都不改变库中已有记录。
+
+按资产列出工单时按工单号升序输出一行 JSON：`{"asset_id": "A001", "tickets": [...]}`，每条工单含 `ticket_id`、`fault_description`、`submitted_date`、`status`、`completed_date`；已完成工单的 `completed_date` 为保存的日期字符串，未完成时为 `null`。资产不存在时退出码非 0、错误写 stderr、stdout 无输出；资产没有工单时 `tickets` 为空数组、退出码 0。维修登记与查询均不修改资产的 `name`、`location`、`purchase_date`、`purchase_amount`、`status` 字段，也不影响折旧与汇总命令的输出。
+
 数据持久化在仓库根目录的 `asset_ledger.db`（SQLite），文件不存在时自动创建。尚未实现维保计划与部件更换记录。
