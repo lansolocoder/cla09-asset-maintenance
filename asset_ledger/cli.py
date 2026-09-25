@@ -6,7 +6,13 @@ import json
 import sys
 
 from . import __version__
-from .ledger import Asset, LedgerError, query_assets, register_asset
+from .ledger import (
+    Asset,
+    LedgerError,
+    calculate_depreciation,
+    query_assets,
+    register_asset,
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -28,6 +34,11 @@ def _build_parser() -> argparse.ArgumentParser:
     query = subparsers.add_parser("query", help="查询资产台账")
     query.add_argument("--category", help="按分类过滤")
     query.add_argument("--location", help="按存放位置过滤")
+
+    depreciate = subparsers.add_parser("depreciate", help="计算资产折旧")
+    depreciate.add_argument("--asset-id", required=True, help="资产编号")
+    depreciate.add_argument("--as-of", required=True, help="评估日期 YYYY-MM-DD")
+    depreciate.add_argument("--annual-rate", required=True, help='年折旧率百分数，如 "5" 或 "2.5"')
 
     return parser
 
@@ -71,6 +82,26 @@ def _run_query(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_depreciate(args: argparse.Namespace) -> int:
+    result = calculate_depreciation(
+        asset_id=args.asset_id,
+        as_of=args.as_of,
+        annual_rate=args.annual_rate,
+    )
+    line = (
+        "{"
+        f'"asset_id": {json.dumps(result.asset_id, ensure_ascii=False)}, '
+        f'"as_of": {json.dumps(result.as_of)}, '
+        f'"purchase_amount": {result.purchase_amount:.2f}, '
+        f'"annual_rate": {float(result.annual_rate)}, '
+        f'"accumulated_depreciation": {result.accumulated_depreciation:.2f}, '
+        f'"net_value": {result.net_value:.2f}'
+        "}"
+    )
+    print(line)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -80,6 +111,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "register":
             return _run_register(args)
+        if args.command == "depreciate":
+            return _run_depreciate(args)
         return _run_query(args)
     except LedgerError as error:
         print(f"error: {error}", file=sys.stderr)

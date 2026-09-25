@@ -157,5 +157,118 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(self.query_records(), [])
 
 
+class DepreciationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.db_path = Path(self._tmpdir.name) / "asset_ledger.db"
+        result = self.invoke(
+            "register",
+            "--asset-id", "A001",
+            "--name", "电脑",
+            "--category", "办公设备",
+            "--location", "办公室",
+            "--purchase-date", "2026-09-25",
+            "--purchase-amount", "8999.00",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        env = dict(os.environ, ASSET_LEDGER_DB=str(self.db_path))
+        return subprocess.run(
+            [sys.executable, "-m", "asset_ledger", *arguments],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def depreciate(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return self.invoke("depreciate", *arguments)
+
+    def set_status(self, status: str) -> None:
+        import sqlite3
+
+        connection = sqlite3.connect(self.db_path)
+        try:
+            connection.execute("UPDATE assets SET status = ?", (status,))
+            connection.commit()
+        finally:
+            connection.close()
+
+    def test_one_year_straight_line_matches_example(self) -> None:
+        result = self.depreciate(
+            "--asset-id", "A001", "--as-of", "2027-09-25", "--annual-rate", "5"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        line = json.loads(result.stdout)
+        self.assertEqual(
+            line,
+            {
+                "asset_id": "A001",
+                "as_of": "2027-09-25",
+                "purchase_amount": 8999.00,
+                "annual_rate": 5.0,
+                "accumulated_depreciation": 449.95,
+                "net_value": 8549.05,
+            },
+        )
+
+    def test_fractional_rate_and_partial_year_by_days(self) -> None:
+        result = self.depreciate(
+            "--asset-id", "A001", "--as-of", "2027-09-25", "--annual-rate", "2.5"
+        )
+        line = json.loads(result.stdout)
+        self.assertEqual(line["annual_rate"], 2.5)
+        self.assertEqual(line["accumulated_depreciation"], 224.98)
+        self.assertEqual(line["net_value"], 8774.02)
+
+        same_day = self.depreciate(
+            "--asset-id", "A001", "--as-of", "2026-09-25", "--annual-rate", "5"
+        )
+        line = json.loads(same_day.stdout)
+        self.assertEqual(line["accumulated_depreciation"], 0.00)
+        self.assertEqual(line["net_value"], 8999.00)
+
+    def test_depreciation_is_capped_at_purchase_amount(self) -> None:
+        result = self.depreciate(
+            "--asset-id", "A001", "--as-of", "2028-09-25", "--annual-rate", "100"
+        )
+        line = json.loads(result.stdout)
+        self.assertEqual(line["accumulated_depreciation"], 8999.00)
+        self.assertEqual(line["net_value"], 0.00)
+
+    def test_non_in_use_asset_can_depreciate(self) -> None:
+        self.set_status("retired")
+        result = self.depreciate(
+            "--asset-id", "A001", "--as-of", "2027-09-25", "--annual-rate", "5"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["accumulated_depreciation"], 449.95)
+
+    def test_errors_leave_empty_stdout_and_unchanged_records(self) -> None:
+        bad_calls = [
+            ("--asset-id", "NOPE", "--as-of", "2027-09-25", "--annual-rate", "5"),
+            ("--asset-id", "A001", "--as-of", "2026-09-24", "--annual-rate", "5"),
+            ("--asset-id", "A001", "--as-of", "2027/09/25", "--annual-rate", "5"),
+            ("--asset-id", "A001", "--as-of", "2027-13-01", "--annual-rate", "5"),
+            ("--asset-id", "A001", "--as-of", "2027-09-25", "--annual-rate", "abc"),
+            ("--asset-id", "A001", "--as-of", "2027-09-25", "--annual-rate", "-1"),
+            ("--asset-id", "A001", "--as-of", "2027-09-25", "--annual-rate", "100.1"),
+        ]
+        for arguments in bad_calls:
+            with self.subTest(arguments=arguments):
+                result = self.depreciate(*arguments)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotEqual(result.stderr, "")
+                self.assertEqual(result.stdout, "")
+        query = self.invoke("query")
+        records = json.loads(query.stdout)["records"]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["purchase_amount"], 8999.00)
+
+
 if __name__ == "__main__":
     unittest.main()

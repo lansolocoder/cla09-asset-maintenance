@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import os
 from pathlib import Path
 import re
@@ -18,6 +18,7 @@ DB_PATH = Path(
 
 _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _AMOUNT_RE = re.compile(r"\d+(\.\d{1,2})?")
+_RATE_RE = re.compile(r"\d+(\.\d+)?|\.\d+")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS assets (
@@ -162,3 +163,81 @@ def query_assets(
     with _connect(db_path) as connection:
         rows = connection.execute(statement, parameters).fetchall()
     return [_row_to_asset(row) for row in rows]
+
+
+def _validate_as_of_date(value: str) -> date:
+    if not _DATE_RE.fullmatch(value):
+        raise LedgerError(f"as-of date must be in YYYY-MM-DD format: {value!r}")
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise LedgerError(f"as-of date is not a valid date: {value!r}") from None
+
+
+def _validate_rate(value: str) -> Decimal:
+    if not _RATE_RE.fullmatch(value):
+        raise LedgerError(f"annual rate is not a number: {value!r}")
+    rate = Decimal(value)
+    if rate < 0 or rate > 100:
+        raise LedgerError(f"annual rate must be a number between 0 and 100: {value!r}")
+    return rate
+
+
+def get_asset(asset_id: str, db_path: Path = DB_PATH) -> Asset:
+    """Return the asset with the given id; raise LedgerError if unknown."""
+    with _connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT asset_id, name, category, location, purchase_date, "
+            "purchase_amount, status FROM assets WHERE asset_id = ?",
+            (asset_id,),
+        ).fetchone()
+    if row is None:
+        raise LedgerError(f"unknown asset id: {asset_id!r}")
+    return _row_to_asset(row)
+
+
+@dataclass(frozen=True)
+class DepreciationResult:
+    asset_id: str
+    as_of: str
+    purchase_amount: Decimal
+    annual_rate: Decimal
+    accumulated_depreciation: Decimal
+    net_value: Decimal
+
+
+def calculate_depreciation(
+    asset_id: str,
+    as_of: str,
+    annual_rate: str,
+    db_path: Path = DB_PATH,
+) -> DepreciationResult:
+    """Straight-line depreciation prorated by elapsed days / 365."""
+    asset = get_asset(asset_id, db_path=db_path)
+    as_of_date = _validate_as_of_date(as_of)
+    rate = _validate_rate(annual_rate)
+
+    purchase_date = date.fromisoformat(asset.purchase_date)
+    if as_of_date < purchase_date:
+        raise LedgerError(
+            f"as-of date {as_of!r} is before purchase date {asset.purchase_date!r}"
+        )
+
+    elapsed_days = (as_of_date - purchase_date).days
+    purchase_amount = asset.purchase_amount
+    depreciation = (
+        purchase_amount * rate / Decimal("100") * elapsed_days / Decimal("365")
+    )
+    depreciation = depreciation.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if depreciation > purchase_amount:
+        depreciation = purchase_amount
+    net_value = purchase_amount - depreciation
+
+    return DepreciationResult(
+        asset_id=asset.asset_id,
+        as_of=as_of,
+        purchase_amount=purchase_amount,
+        annual_rate=rate,
+        accumulated_depreciation=depreciation,
+        net_value=net_value,
+    )
