@@ -47,4 +47,22 @@ python3 -m asset_ledger depreciation --asset-id A001 --as-of 2026-09-30
 
 资产编号不存在或 `--as-of` 不是合法的 `YYYY-MM-DD` 时，退出码非 0、错误写 stderr、stdout 无输出。折旧查询为只读操作，不修改台账中的任何字段。
 
+## 月度折旧汇总
+
+```bash
+python3 -m asset_ledger depreciation-summary --month 2026-09
+```
+
+对台账中**全部资产**输出指定月份的折旧汇总。`--month` 必填，格式为 `YYYY-MM`，须为真实月份。口径与单条折旧查询一致：直线法、残值取购置金额 5%、月折旧额 =（购置金额 − 残值）÷ 60 后 half-up 保留两位小数；已折旧月数为购置日期到**该月月末**的整月数（不足整月不计），累计折旧不超过可折旧总额、净值不低于残值。`--month` 的月末（该月最后一天）即累计折旧与净值的截止日。
+
+当月折旧额仅当该月已过整月（月末不早于购置日）时等于月折旧额，否则为 0.00；折旧期已满的月份取 `min(月折旧额, 可折旧总额 − 该月月初累计折旧)`，不重复计提，期满后各月为 0.00。
+
+成功时退出码 0，stdout 输出一行 JSON，`records` 按 `asset_id` 升序：
+
+```json
+{"month": "2026-09", "records": [{"asset_id": "A001", "purchase_amount": 1000.00, "monthly_depreciation": 15.83, "accumulated_depreciation": 950.00, "net_book_value": 50.00}], "totals": {"total_monthly": 15.83, "total_accumulated": 950.00, "total_net_book_value": 50.00}}
+```
+
+每条记录含 `asset_id`、`purchase_amount`、`monthly_depreciation`（当月计提）、`accumulated_depreciation`（截至月末）、`net_book_value`（截至月末），金额均为保留两位小数的数字；`totals` 固定含 `total_monthly`、`total_accumulated`、`total_net_book_value`。台账为空时 `records` 为空数组、`totals` 各值为 0.00，退出码仍为 0。`--month` 非法（非 `YYYY-MM` 或非真实月份，如 `2026-13`）时退出码非 0、错误写 stderr、stdout 无输出。月度汇总为只读操作，不修改台账中的任何字段。
+
 数据持久化在仓库根目录的 `asset_ledger.db`（SQLite），文件不存在时自动创建。尚未实现维保计划与部件更换记录。

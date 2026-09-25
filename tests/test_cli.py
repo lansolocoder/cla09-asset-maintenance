@@ -294,5 +294,198 @@ class DepreciationTests(unittest.TestCase):
         self.assertEqual(records[0]["purchase_amount"], 1000.00)
 
 
+class DepreciationSummaryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.db_path = Path(self._tmpdir.name) / "asset_ledger.db"
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        env = dict(os.environ, ASSET_LEDGER_DB=str(self.db_path))
+        return subprocess.run(
+            [sys.executable, "-m", "asset_ledger", *arguments],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def register(
+        self,
+        asset_id: str,
+        amount: str = "1000.00",
+        date_: str = "2021-03-15",
+    ) -> None:
+        result = self.invoke(
+            "register",
+            "--asset-id", asset_id,
+            "--name", "电脑",
+            "--category", "办公设备",
+            "--location", "办公室",
+            "--purchase-date", date_,
+            "--purchase-amount", amount,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def summary(self, month: str) -> dict[str, object]:
+        result = self.invoke("depreciation-summary", "--month", month)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        lines = result.stdout.splitlines()
+        self.assertEqual(len(lines), 1)
+        return json.loads(lines[0])
+
+    def test_empty_ledger(self) -> None:
+        line = self.summary("2026-09")
+        self.assertEqual(line["month"], "2026-09")
+        self.assertEqual(line["records"], [])
+        self.assertEqual(
+            line["totals"],
+            {
+                "total_monthly": 0.00,
+                "total_accumulated": 0.00,
+                "total_net_book_value": 0.00,
+            },
+        )
+
+    def test_records_sorted_and_totalled(self) -> None:
+        self.register("B002", amount="1000.00", date_="2021-03-15")
+        self.register("A001", amount="10.00", date_="2015-01-10")
+        self.register("C003", amount="123.40", date_="2026-09-25")
+        line = self.summary("2021-04")
+        self.assertEqual(
+            [r["asset_id"] for r in line["records"]], ["A001", "B002", "C003"]
+        )
+        a001, b002, c003 = line["records"]
+        # A001 long fully depreciated (month 75): no current charge, at residual.
+        self.assertEqual(
+            a001,
+            {
+                "asset_id": "A001",
+                "purchase_amount": 10.00,
+                "monthly_depreciation": 0.00,
+                "accumulated_depreciation": 9.50,
+                "net_book_value": 0.50,
+            },
+        )
+        # B002: first whole month completed 2021-04-15.
+        self.assertEqual(
+            b002,
+            {
+                "asset_id": "B002",
+                "purchase_amount": 1000.00,
+                "monthly_depreciation": 15.83,
+                "accumulated_depreciation": 15.83,
+                "net_book_value": 984.17,
+            },
+        )
+        # C003 purchased far in the future: nothing charged yet.
+        self.assertEqual(
+            c003,
+            {
+                "asset_id": "C003",
+                "purchase_amount": 123.40,
+                "monthly_depreciation": 0.00,
+                "accumulated_depreciation": 0.00,
+                "net_book_value": 123.40,
+            },
+        )
+        self.assertEqual(
+            line["totals"],
+            {
+                "total_monthly": 15.83,
+                "total_accumulated": 25.33,
+                "total_net_book_value": 1108.07,
+            },
+        )
+
+    def test_purchase_month_is_not_charged(self) -> None:
+        self.register("A001", date_="2021-03-15")
+        line = self.summary("2021-03")
+        record = line["records"][0]
+        self.assertEqual(record["monthly_depreciation"], 0.00)
+        self.assertEqual(record["accumulated_depreciation"], 0.00)
+        self.assertEqual(record["net_book_value"], 1000.00)
+
+    def test_month_before_purchase(self) -> None:
+        self.register("A001", date_="2021-03-15")
+        line = self.summary("2020-12")
+        record = line["records"][0]
+        self.assertEqual(record["monthly_depreciation"], 0.00)
+        self.assertEqual(record["accumulated_depreciation"], 0.00)
+        self.assertEqual(record["net_book_value"], 1000.00)
+
+    def test_final_month_is_capped_then_zero(self) -> None:
+        # Monthly 0.16, but the depreciable total is 9.50, so month 60 is 0.06.
+        self.register("A001", amount="10.00", date_="2015-01-10")
+        month_59 = self.summary("2019-12")["records"][0]
+        self.assertEqual(month_59["monthly_depreciation"], 0.16)
+        self.assertEqual(month_59["accumulated_depreciation"], 9.44)
+        month_60 = self.summary("2020-01")["records"][0]
+        self.assertEqual(month_60["monthly_depreciation"], 0.06)
+        self.assertEqual(month_60["accumulated_depreciation"], 9.50)
+        self.assertEqual(month_60["net_book_value"], 0.50)
+        after = self.summary("2020-02")["records"][0]
+        self.assertEqual(after["monthly_depreciation"], 0.00)
+        self.assertEqual(after["accumulated_depreciation"], 9.50)
+        self.assertEqual(after["net_book_value"], 0.50)
+
+    def test_matches_single_depreciation_at_month_end(self) -> None:
+        self.register("A001", date_="2021-03-15")
+        record = self.summary("2025-09")["records"][0]
+        single = json.loads(
+            self.invoke(
+                "depreciation", "--asset-id", "A001", "--as-of", "2025-09-30"
+            ).stdout
+        )
+        self.assertEqual(record["purchase_amount"], single["purchase_amount"])
+        self.assertEqual(
+            record["accumulated_depreciation"], single["accumulated_depreciation"]
+        )
+        self.assertEqual(record["net_book_value"], single["net_book_value"])
+        # 54 whole months: 15.83 * 54 = 854.82.
+        self.assertEqual(record["monthly_depreciation"], 15.83)
+        self.assertEqual(record["accumulated_depreciation"], 854.82)
+        self.assertEqual(record["net_book_value"], 145.18)
+
+    def test_amounts_are_two_place_numbers(self) -> None:
+        self.register("A001", amount="1000.00", date_="2021-03-15")
+        out = self.invoke("depreciation-summary", "--month", "2021-04").stdout
+        for token in ("1000.00", "15.83", "984.17"):
+            self.assertIn(token, out)
+        record = json.loads(out)["records"][0]
+        for key in (
+            "purchase_amount",
+            "monthly_depreciation",
+            "accumulated_depreciation",
+            "net_book_value",
+        ):
+            self.assertIsInstance(record[key], float)
+
+    def test_invalid_month_is_an_error(self) -> None:
+        self.register("A001")
+        for bad_month in ("2026/09", "2026-13", "2026-00", "2026-9", "abc", ""):
+            with self.subTest(bad_month=bad_month):
+                result = self.invoke("depreciation-summary", "--month", bad_month)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotEqual(result.stderr, "")
+                self.assertEqual(result.stdout, "")
+
+    def test_missing_month_is_an_error(self) -> None:
+        result = self.invoke("depreciation-summary")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--month", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_summary_is_read_only(self) -> None:
+        self.register("A001")
+        self.summary("2026-09")
+        records = json.loads(self.invoke("query").stdout)["records"]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["status"], "in_use")
+        self.assertEqual(records[0]["purchase_amount"], 1000.00)
+
+
 if __name__ == "__main__":
     unittest.main()
