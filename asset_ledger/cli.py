@@ -1,4 +1,4 @@
-"""命令行入口：资产登记、存放位置变更与查询。
+"""命令行入口：资产登记、存放位置变更、维保计划与查询。
 
 调用方式：python3 -m asset_ledger <子命令> [参数]
 业务错误输出到 stderr 并以非零状态退出，且不写入任何数据。
@@ -17,9 +17,12 @@ from . import storage
 from .storage import (
     DEFAULT_DB_FILENAME,
     AssetView,
+    DueItem,
     LedgerError,
     LocationRecord,
+    MaintenancePlan,
     MoveResult,
+    PlanResult,
     RegisterResult,
 )
 
@@ -65,6 +68,41 @@ def _print_asset(asset: AssetView) -> None:
     _print_history(asset.history)
 
 
+def _print_plan_result(result: PlanResult) -> None:
+    print(f"计划编号: {result.plan_id}")
+    print(f"资产编号: {result.asset_id}")
+    print(f"首次到期日期: {result.first_due}")
+
+
+def _print_plans(asset_id: str, plans: Sequence[MaintenancePlan]) -> None:
+    print(f"资产 {asset_id} 的维保计划:")
+    if not plans:
+        print("  （无记录）")
+        return
+    for seq, plan in enumerate(plans, start=1):
+        print(
+            f"  {seq}. 计划编号: {plan.plan_id} "
+            f"维保类型: {plan.maint_type} "
+            f"首次到期日期: {plan.first_due} "
+            f"周期天数: {plan.interval_days}"
+        )
+
+
+def _print_due_items(until: str, items: Sequence[DueItem]) -> None:
+    print(f"到期待办（截止日期 {until}）:")
+    if not items:
+        print("  （无到期计划）")
+        return
+    for seq, item in enumerate(items, start=1):
+        print(
+            f"  {seq}. 计划编号: {item.plan_id} "
+            f"资产编号: {item.asset_id} "
+            f"维保类型: {item.maint_type} "
+            f"下一次到期日期: {item.next_due} "
+            f"当前存放位置: {item.location}"
+        )
+
+
 def _add_db_argument(parser: argparse.ArgumentParser, *, suppress: bool = False) -> None:
     parser.add_argument(
         "--db",
@@ -79,7 +117,7 @@ def _add_db_argument(parser: argparse.ArgumentParser, *, suppress: bool = False)
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="asset-ledger",
-        description="本地设备资产台账：登记资产、记录存放位置变更并提供查询。",
+        description="本地设备资产台账：登记资产、记录存放位置变更、管理维保计划并提供查询。",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     _add_db_argument(parser)
@@ -122,6 +160,39 @@ def build_parser() -> argparse.ArgumentParser:
     show_parser.add_argument("--id", dest="asset_id", required=True, help="资产编号")
     show_parser.set_defaults(handler=_handle_show)
 
+    plan_parser = subparsers.add_parser(
+        "plan", help="为已登记资产登记维保计划（历史计划只增不改）"
+    )
+    _add_db_argument(plan_parser, suppress=True)
+    plan_parser.add_argument(
+        "--id", dest="plan_id", required=True, help="计划编号（全局唯一）"
+    )
+    plan_parser.add_argument("--asset", dest="asset_id", required=True, help="资产编号")
+    plan_parser.add_argument("--type", dest="maint_type", required=True, help="维保类型")
+    plan_parser.add_argument(
+        "--first-due", required=True, help="首次到期日期，格式 YYYY-MM-DD"
+    )
+    plan_parser.add_argument(
+        "--interval", required=True, help="周期天数（正整数）"
+    )
+    plan_parser.set_defaults(handler=_handle_plan)
+
+    plans_parser = subparsers.add_parser(
+        "plans", help="按资产编号列出该资产的全部维保计划"
+    )
+    _add_db_argument(plans_parser, suppress=True)
+    plans_parser.add_argument("--asset", dest="asset_id", required=True, help="资产编号")
+    plans_parser.set_defaults(handler=_handle_plans)
+
+    due_parser = subparsers.add_parser(
+        "due", help="到期待办：列出下一次到期日期不晚于截止日期的维保计划"
+    )
+    _add_db_argument(due_parser, suppress=True)
+    due_parser.add_argument(
+        "--until", required=True, help="截止日期，格式 YYYY-MM-DD"
+    )
+    due_parser.set_defaults(handler=_handle_due)
+
     return parser
 
 
@@ -159,6 +230,37 @@ def _handle_show(args: argparse.Namespace) -> int:
     storage.init_db(db_path)
     asset = storage.get_asset(db_path, asset_id=args.asset_id)
     _print_asset(asset)
+    return 0
+
+
+def _handle_plan(args: argparse.Namespace) -> int:
+    db_path = _resolve_db_path(args)
+    storage.init_db(db_path)
+    result = storage.register_plan(
+        db_path,
+        plan_id=args.plan_id,
+        asset_id=args.asset_id,
+        maint_type=args.maint_type,
+        first_due=args.first_due,
+        interval=args.interval,
+    )
+    _print_plan_result(result)
+    return 0
+
+
+def _handle_plans(args: argparse.Namespace) -> int:
+    db_path = _resolve_db_path(args)
+    storage.init_db(db_path)
+    plans = storage.list_plans(db_path, asset_id=args.asset_id)
+    _print_plans(args.asset_id, plans)
+    return 0
+
+
+def _handle_due(args: argparse.Namespace) -> int:
+    db_path = _resolve_db_path(args)
+    storage.init_db(db_path)
+    items = storage.due_plans(db_path, until=args.until)
+    _print_due_items(args.until, items)
     return 0
 
 
