@@ -185,6 +185,182 @@ class LedgerCliTests(unittest.TestCase):
         )
         self.assertNotEqual(empty_location.returncode, 0)
 
+    # ---- 报废 ----------------------------------------------------------
+
+    def scrap(
+        self,
+        asset_id: str = "A001",
+        scrap_date: str = "2026-09-01",
+        reason: str = "设备老化无法维修",
+        request_id: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        args = ["scrap", "--id", asset_id, "--date", scrap_date, "--reason", reason]
+        if request_id is not None:
+            args.extend(["--request-id", request_id])
+        return self.invoke(*args)
+
+    def test_scrap_success_output_and_status(self) -> None:
+        self.register()
+        result = self.scrap()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("资产编号: A001", result.stdout)
+        self.assertIn("状态: 已报废", result.stdout)
+        self.assertIn("报废日期: 2026-09-01", result.stdout)
+        self.assertEqual(result.stderr, "")
+
+        shown = self.invoke("show", "--id", "A001")
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertIn("状态: 已报废", shown.stdout)
+        # 报废只增一条记录，不改动位置历史。
+        self.assertIn("当前存放位置: 北京办公室", shown.stdout)
+        self.assertEqual(shown.stdout.count("[初始]"), 1)
+
+    def test_scrap_appends_exactly_one_record(self) -> None:
+        self.register()
+        self.assertEqual(self.scrap().returncode, 0)
+        import sqlite3
+
+        count = sqlite3.connect(str(self.db)).execute(
+            "SELECT COUNT(*) FROM scrap_records WHERE asset_id = ?", ("A001",)
+        ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_scrap_unknown_asset_fails_and_writes_nothing(self) -> None:
+        result = self.scrap("GHOST")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("未登记", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_scrap_date_before_last_location_record_rejected(self) -> None:
+        self.register()
+        self.assertEqual(
+            self.invoke(
+                "move", "--id", "A001", "--location", "上海分部", "--date", "2026-03-01"
+            ).returncode,
+            0,
+        )
+        result = self.scrap(scrap_date="2026-02-28")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("最后一条位置记录日期", result.stderr)
+        # 失败不改动状态，也不写报废记录。
+        self.assertIn("状态: 在用", self.invoke("show", "--id", "A001").stdout)
+
+    def test_scrap_date_equal_to_last_location_record_allowed(self) -> None:
+        self.register()
+        self.assertEqual(
+            self.invoke(
+                "move", "--id", "A001", "--location", "上海分部", "--date", "2026-03-01"
+            ).returncode,
+            0,
+        )
+        result = self.scrap(scrap_date="2026-03-01")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("状态: 已报废", result.stdout)
+
+    def test_scrap_rejects_bad_date_and_empty_reason(self) -> None:
+        self.register()
+        for bad in ["2026/09/01", "2026-9-1", "20260901", "2026-13-01", "not-a-date"]:
+            with self.subTest(bad=bad):
+                result = self.scrap(scrap_date=bad)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("日期", result.stderr)
+        empty = self.scrap(reason="   ")
+        self.assertNotEqual(empty.returncode, 0)
+        self.assertIn("报废原因", empty.stderr)
+        self.assertIn("状态: 在用", self.invoke("show", "--id", "A001").stdout)
+
+    def test_double_scrap_without_request_id_fails(self) -> None:
+        self.register()
+        self.assertEqual(self.scrap().returncode, 0)
+        again = self.scrap(reason="再次报废")
+        self.assertNotEqual(again.returncode, 0)
+        self.assertIn("已报废", again.stderr)
+        self.assertEqual(again.stdout, "")
+
+    def test_scrapped_asset_blocks_move_and_plan_register(self) -> None:
+        self.register()
+        self.assertEqual(self.scrap().returncode, 0)
+        moved = self.invoke(
+            "move", "--id", "A001", "--location", "广州", "--date", "2026-09-05"
+        )
+        self.assertNotEqual(moved.returncode, 0)
+        self.assertIn("已报废", moved.stderr)
+        planned = self.invoke(
+            "plan-register",
+            "--plan-id", "P001", "--asset-id", "A001",
+            "--type", "保养",
+            "--first-due-date", "2026-10-01", "--period-days", "30",
+        )
+        self.assertNotEqual(planned.returncode, 0)
+        self.assertIn("已报废", planned.stderr)
+        # 不产生任何记录：位置历史不变，维保计划清单为空。
+        shown = self.invoke("show", "--id", "A001")
+        self.assertNotIn("广州", shown.stdout)
+        self.assertNotIn("[变更]", shown.stdout)
+        listed = self.invoke("plan-list", "--asset-id", "A001")
+        self.assertIn("无记录", listed.stdout)
+
+    def test_scrapped_asset_still_showable(self) -> None:
+        self.register()
+        self.assertEqual(self.scrap().returncode, 0)
+        shown = self.invoke("show", "--id", "A001")
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertIn("状态: 已报废", shown.stdout)
+
+    def test_scrap_idempotent_identical_retry(self) -> None:
+        self.register()
+        first = self.scrap(request_id="REQ-1")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        second = self.scrap(request_id="REQ-1")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(second.stdout, first.stdout)
+
+        import sqlite3
+
+        conn = sqlite3.connect(str(self.db))
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM scrap_records WHERE asset_id = ?", ("A001",)
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            conn.execute(
+                "SELECT status FROM assets WHERE asset_id = ?", ("A001",)
+            ).fetchone()[0],
+            "已报废",
+        )
+
+    def test_scrap_request_id_conflict_on_different_payload_fails(self) -> None:
+        self.register()
+        self.assertEqual(self.scrap(request_id="REQ-2").returncode, 0)
+        for kwargs in (
+            {"scrap_date": "2026-09-02"},
+            {"reason": "另一个原因"},
+        ):
+            with self.subTest(kwargs=kwargs):
+                result = self.scrap(request_id="REQ-2", **kwargs)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("请求编号", result.stderr)
+                self.assertEqual(result.stdout, "")
+
+    def test_scrap_request_id_reused_for_other_asset_fails(self) -> None:
+        self.register("A001")
+        self.register("A002", location="上海仓库")
+        self.assertEqual(self.scrap("A001", request_id="REQ-3").returncode, 0)
+        other = self.scrap("A002", request_id="REQ-3")
+        self.assertNotEqual(other.returncode, 0)
+        self.assertIn("请求编号", other.stderr)
+        # 第二台资产仍为在用，未被报废。
+        self.assertIn("状态: 在用", self.invoke("show", "--id", "A002").stdout)
+
+    def test_scrap_empty_request_id_rejected(self) -> None:
+        self.register()
+        result = self.scrap(request_id="   ")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("请求编号", result.stderr)
+        self.assertIn("状态: 在用", self.invoke("show", "--id", "A001").stdout)
+
     # ---- 查询 ----------------------------------------------------------
 
     def test_show_full_history(self) -> None:
