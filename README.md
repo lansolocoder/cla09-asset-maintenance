@@ -30,4 +30,14 @@ python3 -m asset_ledger query --location 办公室     # 按存放位置过滤
 
 多个过滤条件同时给出时取交集。结果按资产编号升序输出为 JSON：`{"records": [...]}`，每条记录含 `asset_id`、`name`、`category`、`location`、`purchase_date`、`purchase_amount`（保留两位小数的数字）、`status`。无匹配时 `records` 为空数组，退出码仍为 0。
 
-数据持久化在仓库根目录的 `asset_ledger.db`（SQLite），文件不存在时自动创建。尚未实现维保计划、部件更换记录以及折旧计算。
+## 资产折旧计算
+
+```bash
+python3 -m asset_ledger depreciate --asset-id A001 --as-of 2027-09-25 --annual-rate 5
+```
+
+按年限平均法（直线法）计算截至评估日期的累计折旧与净值。年折旧率以百分数传入（如 `5` 或 `2.5`，表示每年折旧购置金额的该百分比）；折旧自购置日期起算，按已使用天数占 365 天的比例计算（不足一年按天计），保留两位小数、四舍五入。累计折旧最多折到购置金额为止，净值不低于 `0.00`。已登记但状态不是 `in_use` 的资产同样可计算。
+
+成功时退出码为 0，stdout 输出一行 JSON：`{"asset_id": "A001", "as_of": "2027-09-25", "purchase_amount": 8999.00, "annual_rate": 5.0, "accumulated_depreciation": 449.95, "net_value": 8549.05}`，其中金额字段为保留两位小数的数字，`annual_rate` 为数字。评估日期早于购置日期、非法日期、非法折旧率（非数字、负数、超过 100）、未知资产编号均为业务错误（退出码非 0，错误写 stderr，stdout 为空，库中记录不变）。
+
+数据持久化在仓库根目录的 `asset_ledger.db`（SQLite），文件不存在时自动创建。尚未实现维保计划与部件更换记录。

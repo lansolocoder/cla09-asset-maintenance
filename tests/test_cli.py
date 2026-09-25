@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -155,6 +156,192 @@ class LedgerTests(unittest.TestCase):
         self.assertNotEqual(result.stderr, "")
         self.assertEqual(result.stdout, "")
         self.assertEqual(self.query_records(), [])
+
+
+class DepreciationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.db_path = Path(self._tmpdir.name) / "asset_ledger.db"
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        env = dict(os.environ, ASSET_LEDGER_DB=str(self.db_path))
+        return subprocess.run(
+            [sys.executable, "-m", "asset_ledger", *arguments],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def depreciate(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            "depreciate",
+            "--asset-id",
+            "A001",
+            "--as-of",
+            "2027-09-25",
+            "--annual-rate",
+            "5",
+            *arguments,
+        )
+
+    def register(self, **overrides: str) -> subprocess.CompletedProcess[str]:
+        fields = {
+            "asset-id": "A001",
+            "name": "电脑",
+            "category": "办公设备",
+            "location": "办公室",
+            "purchase-date": "2026-09-25",
+            "purchase-amount": "8999.00",
+        }
+        fields.update(overrides)
+        arguments = ["register"]
+        for key, value in fields.items():
+            arguments += [f"--{key}", value]
+        return self.invoke(*arguments)
+
+    def set_status(self, status: str) -> None:
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                "UPDATE assets SET status = ? WHERE asset_id = ?", (status, "A001")
+            )
+
+    def test_straight_line_depreciation_after_one_year(self) -> None:
+        self.assertEqual(self.register().returncode, 0)
+        result = self.depreciate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        line = json.loads(result.stdout)
+        self.assertEqual(
+            line,
+            {
+                "asset_id": "A001",
+                "as_of": "2027-09-25",
+                "purchase_amount": 8999.00,
+                "annual_rate": 5.0,
+                "accumulated_depreciation": 449.95,
+                "net_value": 8549.05,
+            },
+        )
+        self.assertEqual(
+            result.stdout.strip(),
+            '{"asset_id": "A001", "as_of": "2027-09-25", '
+            '"purchase_amount": 8999.00, "annual_rate": 5.0, '
+            '"accumulated_depreciation": 449.95, "net_value": 8549.05}',
+        )
+
+    def test_partial_year_counts_by_days(self) -> None:
+        self.register()
+        result = self.invoke(
+            "depreciate",
+            "--asset-id",
+            "A001",
+            "--as-of",
+            "2026-10-25",
+            "--annual-rate",
+            "5",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = json.loads(result.stdout)
+        # 30 days: 8999.00 * 0.05 * 30 / 365 = 36.9821... -> 36.98
+        self.assertEqual(line["accumulated_depreciation"], 36.98)
+        self.assertEqual(line["net_value"], 8962.02)
+        self.assertEqual(line["annual_rate"], 5.0)
+
+    def test_fractional_rate_is_accepted(self) -> None:
+        self.register()
+        result = self.invoke(
+            "depreciate",
+            "--asset-id",
+            "A001",
+            "--as-of",
+            "2026-09-25",
+            "--annual-rate",
+            "2.5",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = json.loads(result.stdout)
+        self.assertEqual(line["annual_rate"], 2.5)
+        self.assertEqual(line["accumulated_depreciation"], 0.00)
+        self.assertEqual(line["net_value"], 8999.00)
+
+    def test_depreciation_is_capped_at_purchase_amount(self) -> None:
+        self.register()
+        result = self.invoke(
+            "depreciate",
+            "--asset-id",
+            "A001",
+            "--as-of",
+            "2099-01-01",
+            "--annual-rate",
+            "100",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = json.loads(result.stdout)
+        self.assertEqual(line["accumulated_depreciation"], 8999.00)
+        self.assertEqual(line["net_value"], 0.00)
+
+    def test_asset_not_in_use_can_still_depreciate(self) -> None:
+        self.register()
+        self.set_status("retired")
+        result = self.depreciate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["net_value"], 8549.05)
+
+    def test_error_cases(self) -> None:
+        self.register()
+        bad_calls = [
+            ("A404", "2027-09-25", "5"),
+            ("A001", "2025-09-25", "5"),  # before purchase date
+            ("A001", "2027/09/25", "5"),
+            ("A001", "2027-02-30", "5"),
+            ("A001", "2027-09-25", "abc"),
+            ("A001", "2027-09-25", "-1"),
+            ("A001", "2027-09-25", "100.1"),
+            ("A001", "2027-09-25", ""),
+        ]
+        for asset_id, as_of, rate in bad_calls:
+            with self.subTest(call=(asset_id, as_of, rate)):
+                result = self.invoke(
+                    "depreciate",
+                    "--asset-id",
+                    asset_id,
+                    "--as-of",
+                    as_of,
+                    "--annual-rate",
+                    rate,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotEqual(result.stderr, "")
+                self.assertEqual(result.stdout, "")
+
+    def test_missing_required_argument_is_an_error(self) -> None:
+        result = self.invoke(
+            "depreciate", "--asset-id", "A001", "--as-of", "2027-09-25"
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotEqual(result.stderr, "")
+        self.assertEqual(result.stdout, "")
+
+    def test_unsuccessful_depreciation_does_not_change_records(self) -> None:
+        self.register()
+        result = self.invoke(
+            "depreciate",
+            "--asset-id",
+            "A001",
+            "--as-of",
+            "2025-01-01",
+            "--annual-rate",
+            "5",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        with sqlite3.connect(self.db_path) as connection:
+            row = connection.execute(
+                "SELECT asset_id, status FROM assets"
+            ).fetchall()
+        self.assertEqual(row, [("A001", "in_use")])
 
 
 if __name__ == "__main__":
