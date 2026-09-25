@@ -31,7 +31,22 @@ CREATE TABLE IF NOT EXISTS assets (
 )
 """
 
+_TICKET_SCHEMA = """
+CREATE TABLE IF NOT EXISTS maintenance_tickets (
+    ticket_id TEXT PRIMARY KEY,
+    asset_id TEXT NOT NULL,
+    fault_description TEXT NOT NULL,
+    submitted_date TEXT NOT NULL,
+    status TEXT NOT NULL,
+    completed_date TEXT,
+    FOREIGN KEY (asset_id) REFERENCES assets (asset_id)
+)
+"""
+
 STATUS_IN_USE = "in_use"
+
+TICKET_STATUS_SUBMITTED = "submitted"
+TICKET_STATUS_COMPLETED = "completed"
 
 DEPRECIATION_YEARS = 5
 RESIDUAL_RATE = Decimal("0.05")
@@ -85,6 +100,7 @@ def _validate_amount(value: str) -> Decimal:
 def _connect(db_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(db_path)
     connection.execute(_SCHEMA)
+    connection.execute(_TICKET_SCHEMA)
     return connection
 
 
@@ -179,6 +195,169 @@ def get_asset(asset_id: str, db_path: Path = DB_PATH) -> Asset:
     if row is None:
         raise LedgerError(f"asset not found: {asset_id!r}")
     return _row_to_asset(row)
+
+
+def _validate_iso_date(value: str, field: str) -> date:
+    if not isinstance(value, str) or not _DATE_RE.fullmatch(value):
+        raise LedgerError(f"{field} must be in YYYY-MM-DD format: {value!r}")
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise LedgerError(f"{field} is not a valid date: {value!r}") from None
+
+
+@dataclass(frozen=True)
+class MaintenanceTicket:
+    ticket_id: str
+    asset_id: str
+    fault_description: str
+    submitted_date: str
+    status: str
+    completed_date: str | None
+
+
+def _row_to_ticket(row: tuple[str, ...]) -> MaintenanceTicket:
+    return MaintenanceTicket(
+        ticket_id=row[0],
+        asset_id=row[1],
+        fault_description=row[2],
+        submitted_date=row[3],
+        status=row[4],
+        completed_date=row[5],
+    )
+
+
+def register_ticket(
+    ticket_id: str,
+    asset_id: str,
+    fault_description: str,
+    submitted_date: str,
+    db_path: Path = DB_PATH,
+) -> MaintenanceTicket:
+    """Validate and store a new maintenance ticket; raise LedgerError on violation.
+
+    The asset must exist and the submitted date must be a valid YYYY-MM-DD date
+    not earlier than the asset's purchase date. No record is created on error.
+    """
+    ticket_id = _require_non_empty("ticket id", ticket_id)
+    fault_description = _require_non_empty("fault description", fault_description)
+    submitted = _validate_iso_date(submitted_date, "submitted date")
+
+    # Existence and the purchase-date bound are checked before any write, so a
+    # failing call never leaves a partial record behind.
+    with _connect(db_path) as connection:
+        asset_row = connection.execute(
+            "SELECT purchase_date FROM assets WHERE asset_id = ?",
+            (asset_id,),
+        ).fetchone()
+        if asset_row is None:
+            raise LedgerError(f"asset not found: {asset_id!r}")
+        purchase_date = date.fromisoformat(asset_row[0])
+        if submitted < purchase_date:
+            raise LedgerError(
+                f"submitted date {submitted_date!r} must not be earlier than "
+                f"the asset purchase date {asset_row[0]}"
+            )
+        try:
+            connection.execute(
+                "INSERT INTO maintenance_tickets (ticket_id, asset_id, "
+                "fault_description, submitted_date, status, completed_date) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    ticket_id,
+                    asset_id,
+                    fault_description,
+                    submitted_date,
+                    TICKET_STATUS_SUBMITTED,
+                    None,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            raise LedgerError(
+                f"ticket id already registered: {ticket_id!r}"
+            ) from None
+
+    return MaintenanceTicket(
+        ticket_id=ticket_id,
+        asset_id=asset_id,
+        fault_description=fault_description,
+        submitted_date=submitted_date,
+        status=TICKET_STATUS_SUBMITTED,
+        completed_date=None,
+    )
+
+
+def complete_ticket(
+    ticket_id: str,
+    completed_date: str,
+    db_path: Path = DB_PATH,
+) -> MaintenanceTicket:
+    """Mark a submitted ticket completed; raise LedgerError on any violation.
+
+    The completion date must be a valid YYYY-MM-DD date not earlier than the
+    submitted date. Already-completed and unknown tickets are errors, and no
+    existing record is modified on failure.
+    """
+    ticket_id = _require_non_empty("ticket id", ticket_id)
+    completion = _validate_iso_date(completed_date, "completed date")
+
+    with _connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT ticket_id, asset_id, fault_description, submitted_date, "
+            "status, completed_date FROM maintenance_tickets WHERE ticket_id = ?",
+            (ticket_id,),
+        ).fetchone()
+        if row is None:
+            raise LedgerError(f"ticket not found: {ticket_id!r}")
+        ticket = _row_to_ticket(row)
+        if ticket.status == TICKET_STATUS_COMPLETED:
+            raise LedgerError(f"ticket already completed: {ticket_id!r}")
+        submitted = date.fromisoformat(ticket.submitted_date)
+        if completion < submitted:
+            raise LedgerError(
+                f"completed date {completed_date!r} must not be earlier than "
+                f"the submitted date {ticket.submitted_date}"
+            )
+        connection.execute(
+            "UPDATE maintenance_tickets SET status = ?, completed_date = ? "
+            "WHERE ticket_id = ? AND status = ?",
+            (
+                TICKET_STATUS_COMPLETED,
+                completed_date,
+                ticket_id,
+                TICKET_STATUS_SUBMITTED,
+            ),
+        )
+
+    return MaintenanceTicket(
+        ticket_id=ticket.ticket_id,
+        asset_id=ticket.asset_id,
+        fault_description=ticket.fault_description,
+        submitted_date=ticket.submitted_date,
+        status=TICKET_STATUS_COMPLETED,
+        completed_date=completed_date,
+    )
+
+
+def list_tickets(asset_id: str, db_path: Path = DB_PATH) -> list[MaintenanceTicket]:
+    """Return all tickets for one asset, ordered by ticket id.
+
+    Raises LedgerError if the asset does not exist; an asset without tickets
+    yields an empty list.
+    """
+    with _connect(db_path) as connection:
+        asset_exists = connection.execute(
+            "SELECT 1 FROM assets WHERE asset_id = ?", (asset_id,)
+        ).fetchone()
+        if asset_exists is None:
+            raise LedgerError(f"asset not found: {asset_id!r}")
+        rows = connection.execute(
+            "SELECT ticket_id, asset_id, fault_description, submitted_date, "
+            "status, completed_date FROM maintenance_tickets WHERE asset_id = ? "
+            "ORDER BY ticket_id ASC",
+            (asset_id,),
+        ).fetchall()
+    return [_row_to_ticket(row) for row in rows]
 
 
 def _validate_as_of_date(value: str) -> date:

@@ -444,5 +444,301 @@ class DepreciationSummaryTests(unittest.TestCase):
         self.assertEqual(records[0]["purchase_amount"], 1000.00)
 
 
+class MaintenanceTicketTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.db_path = Path(self._tmpdir.name) / "asset_ledger.db"
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        env = dict(os.environ, ASSET_LEDGER_DB=str(self.db_path))
+        return subprocess.run(
+            [sys.executable, "-m", "asset_ledger", *arguments],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def register_asset(
+        self, asset_id: str = "A001", purchase_date: str = "2021-03-15"
+    ) -> None:
+        result = self.invoke(
+            "register",
+            "--asset-id", asset_id,
+            "--name", "电脑",
+            "--category", "办公设备",
+            "--location", "办公室",
+            "--purchase-date", purchase_date,
+            "--purchase-amount", "1000.00",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def register_ticket(
+        self,
+        ticket_id: str = "T001",
+        asset_id: str = "A001",
+        fault: str = "无法开机",
+        submitted_date: str = "2026-09-20",
+    ) -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            "register-ticket",
+            "--ticket-id", ticket_id,
+            "--asset-id", asset_id,
+            "--fault-description", fault,
+            "--submitted-date", submitted_date,
+        )
+
+    def list_tickets(self, asset_id: str = "A001") -> dict[str, object]:
+        result = self.invoke("list-tickets", "--asset-id", asset_id)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        lines = result.stdout.splitlines()
+        self.assertEqual(len(lines), 1)
+        return json.loads(lines[0])
+
+    def test_register_ticket_outputs_status_submitted(self) -> None:
+        self.register_asset()
+        result = self.register_ticket()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(
+            json.loads(result.stdout),
+            {"asset_id": "A001", "ticket_id": "T001", "status": "submitted"},
+        )
+        tickets = self.list_tickets()["tickets"]
+        self.assertEqual(len(tickets), 1)
+        self.assertEqual(
+            tickets[0],
+            {
+                "ticket_id": "T001",
+                "fault_description": "无法开机",
+                "submitted_date": "2026-09-20",
+                "status": "submitted",
+                "completed_date": None,
+            },
+        )
+
+    def test_future_submitted_date_is_accepted_as_is(self) -> None:
+        self.register_asset()
+        future = (datetime.date.today() + datetime.timedelta(days=30)).isoformat()
+        result = self.register_ticket(submitted_date=future)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tickets = self.list_tickets()["tickets"]
+        self.assertEqual(tickets[0]["submitted_date"], future)
+
+    def test_tickets_listed_sorted_by_ticket_id(self) -> None:
+        self.register_asset()
+        self.assertEqual(self.register_ticket("T003").returncode, 0)
+        self.assertEqual(self.register_ticket("T001").returncode, 0)
+        self.assertEqual(self.register_ticket("T002").returncode, 0)
+        tickets = self.list_tickets()["tickets"]
+        self.assertEqual([t["ticket_id"] for t in tickets], ["T001", "T002", "T003"])
+
+    def test_complete_ticket_outputs_and_saves_completed_date(self) -> None:
+        self.register_asset()
+        self.assertEqual(self.register_ticket().returncode, 0)
+        result = self.invoke(
+            "complete-ticket", "--ticket-id", "T001", "--completed-date", "2026-09-25"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(
+            json.loads(result.stdout),
+            {"ticket_id": "T001", "status": "completed"},
+        )
+        tickets = self.list_tickets()["tickets"]
+        self.assertEqual(tickets[0]["status"], "completed")
+        self.assertEqual(tickets[0]["completed_date"], "2026-09-25")
+
+    def test_duplicate_ticket_id_is_rejected(self) -> None:
+        self.register_asset()
+        self.assertEqual(self.register_ticket().returncode, 0)
+        result = self.register_ticket(fault="另一故障")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotEqual(result.stderr, "")
+        self.assertEqual(result.stdout, "")
+        tickets = self.list_tickets()["tickets"]
+        self.assertEqual(len(tickets), 1)
+        self.assertEqual(tickets[0]["fault_description"], "无法开机")
+        self.assertEqual(tickets[0]["status"], "submitted")
+
+    def test_duplicate_ticket_id_after_completion_is_rejected(self) -> None:
+        self.register_asset()
+        self.assertEqual(self.register_ticket().returncode, 0)
+        self.assertEqual(
+            self.invoke(
+                "complete-ticket",
+                "--ticket-id", "T001",
+                "--completed-date", "2026-09-25",
+            ).returncode,
+            0,
+        )
+        result = self.register_ticket()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotEqual(result.stderr, "")
+        self.assertEqual(result.stdout, "")
+        tickets = self.list_tickets()["tickets"]
+        self.assertEqual(len(tickets), 1)
+        self.assertEqual(tickets[0]["status"], "completed")
+        self.assertEqual(tickets[0]["completed_date"], "2026-09-25")
+
+    def test_invalid_register_inputs_are_rejected_without_records(self) -> None:
+        self.register_asset()
+        bad_calls = [
+            {"ticket_id": "T001", "asset_id": "NOPE", "fault": "x", "date": "2026-09-20"},
+            {"ticket_id": "T001", "asset_id": "A001", "fault": "  ", "date": "2026-09-20"},
+            {"ticket_id": "", "asset_id": "A001", "fault": "x", "date": "2026-09-20"},
+            {"ticket_id": "T001", "asset_id": "A001", "fault": "x", "date": "2026/09/20"},
+            {"ticket_id": "T001", "asset_id": "A001", "fault": "x", "date": "2026-02-30"},
+            {"ticket_id": "T001", "asset_id": "A001", "fault": "x", "date": "not-a-date"},
+            {"ticket_id": "T001", "asset_id": "A001", "fault": "x", "date": "2021-03-14"},
+        ]
+        for call in bad_calls:
+            with self.subTest(call=call):
+                result = self.invoke(
+                    "register-ticket",
+                    "--ticket-id", call["ticket_id"],
+                    "--asset-id", call["asset_id"],
+                    "--fault-description", call["fault"],
+                    "--submitted-date", call["date"],
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotEqual(result.stderr, "")
+                self.assertEqual(result.stdout, "")
+        self.assertEqual(self.list_tickets()["tickets"], [])
+
+    def test_submitted_date_equal_to_purchase_date_is_allowed(self) -> None:
+        self.register_asset(purchase_date="2021-03-15")
+        result = self.register_ticket(submitted_date="2021-03-15")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_complete_errors_leave_records_unchanged(self) -> None:
+        self.register_asset()
+        self.assertEqual(self.register_ticket().returncode, 0)
+
+        unknown = self.invoke(
+            "complete-ticket", "--ticket-id", "NOPE", "--completed-date", "2026-09-25"
+        )
+        self.assertNotEqual(unknown.returncode, 0)
+        self.assertNotEqual(unknown.stderr, "")
+        self.assertEqual(unknown.stdout, "")
+
+        early = self.invoke(
+            "complete-ticket", "--ticket-id", "T001", "--completed-date", "2026-09-19"
+        )
+        self.assertNotEqual(early.returncode, 0)
+        self.assertNotEqual(early.stderr, "")
+        self.assertEqual(early.stdout, "")
+
+        for bad_date in ("2026/09/25", "2026-13-01", "2026-02-30"):
+            with self.subTest(bad_date=bad_date):
+                result = self.invoke(
+                    "complete-ticket",
+                    "--ticket-id", "T001",
+                    "--completed-date", bad_date,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotEqual(result.stderr, "")
+                self.assertEqual(result.stdout, "")
+
+        tickets = self.list_tickets()["tickets"]
+        self.assertEqual(tickets[0]["status"], "submitted")
+        self.assertIsNone(tickets[0]["completed_date"])
+
+    def test_completing_same_day_as_submitted_is_allowed(self) -> None:
+        self.register_asset()
+        self.assertEqual(self.register_ticket().returncode, 0)
+        result = self.invoke(
+            "complete-ticket", "--ticket-id", "T001", "--completed-date", "2026-09-20"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_already_completed_ticket_cannot_be_completed_again(self) -> None:
+        self.register_asset()
+        self.assertEqual(self.register_ticket().returncode, 0)
+        self.assertEqual(
+            self.invoke(
+                "complete-ticket",
+                "--ticket-id", "T001",
+                "--completed-date", "2026-09-25",
+            ).returncode,
+            0,
+        )
+        result = self.invoke(
+            "complete-ticket",
+            "--ticket-id", "T001",
+            "--completed-date", "2026-09-28",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotEqual(result.stderr, "")
+        self.assertEqual(result.stdout, "")
+        tickets = self.list_tickets()["tickets"]
+        self.assertEqual(tickets[0]["status"], "completed")
+        self.assertEqual(tickets[0]["completed_date"], "2026-09-25")
+
+    def test_list_tickets_empty_asset_is_empty_array(self) -> None:
+        self.register_asset()
+        line = self.list_tickets()
+        self.assertEqual(line, {"asset_id": "A001", "tickets": []})
+
+    def test_list_tickets_unknown_asset_is_an_error(self) -> None:
+        result = self.invoke("list-tickets", "--asset-id", "NOPE")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotEqual(result.stderr, "")
+        self.assertEqual(result.stdout, "")
+
+    def test_tickets_are_scoped_per_asset(self) -> None:
+        self.register_asset("A001")
+        self.register_asset("A002")
+        self.assertEqual(self.register_ticket("T002", asset_id="A002").returncode, 0)
+        self.assertEqual(self.register_ticket("T001", asset_id="A001").returncode, 0)
+        self.assertEqual(
+            [t["ticket_id"] for t in self.list_tickets("A001")["tickets"]], ["T001"]
+        )
+        self.assertEqual(
+            [t["ticket_id"] for t in self.list_tickets("A002")["tickets"]], ["T002"]
+        )
+
+    def test_missing_required_ticket_argument_is_an_error(self) -> None:
+        result = self.invoke("register-ticket", "--ticket-id", "T001")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotEqual(result.stderr, "")
+        self.assertEqual(result.stdout, "")
+
+    def test_ticket_operations_do_not_modify_assets_or_depreciation(self) -> None:
+        self.register_asset()
+        self.assertEqual(self.register_ticket().returncode, 0)
+        self.assertEqual(
+            self.invoke(
+                "complete-ticket",
+                "--ticket-id", "T001",
+                "--completed-date", "2026-09-25",
+            ).returncode,
+            0,
+        )
+        self.list_tickets()
+        records = json.loads(self.invoke("query").stdout)["records"]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["name"], "电脑")
+        self.assertEqual(records[0]["location"], "办公室")
+        self.assertEqual(records[0]["purchase_date"], "2021-03-15")
+        self.assertEqual(records[0]["purchase_amount"], 1000.00)
+        self.assertEqual(records[0]["status"], "in_use")
+
+        depreciation = json.loads(
+            self.invoke("depreciation", "--asset-id", "A001", "--as-of", "2021-04-15").stdout
+        )
+        self.assertEqual(depreciation["elapsed_months"], 1)
+        self.assertEqual(depreciation["net_book_value"], 984.17)
+
+        summary = json.loads(
+            self.invoke("depreciation-summary", "--month", "2021-04").stdout
+        )
+        self.assertEqual(len(summary["records"]), 1)
+        self.assertEqual(summary["records"][0]["monthly_depreciation"], 15.83)
+
+
 if __name__ == "__main__":
     unittest.main()

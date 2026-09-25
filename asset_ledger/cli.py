@@ -12,10 +12,14 @@ from .ledger import (
     DepreciationSummary,
     DepreciationSummaryRecord,
     LedgerError,
+    MaintenanceTicket,
     calculate_depreciation,
     calculate_depreciation_summary,
+    complete_ticket,
+    list_tickets,
     query_assets,
     register_asset,
+    register_ticket,
 )
 
 
@@ -51,6 +55,39 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     depreciation_summary.add_argument(
         "--month", required=True, help="汇总月份 YYYY-MM"
+    )
+
+    register_ticket_parser = subparsers.add_parser(
+        "register-ticket", help="登记维修工单"
+    )
+    register_ticket_parser.add_argument(
+        "--ticket-id", required=True, help="工单号（业务唯一键）"
+    )
+    register_ticket_parser.add_argument(
+        "--asset-id", required=True, help="资产编号"
+    )
+    register_ticket_parser.add_argument(
+        "--fault-description", required=True, help="故障描述（非空）"
+    )
+    register_ticket_parser.add_argument(
+        "--submitted-date", required=True, help="送修日期 YYYY-MM-DD"
+    )
+
+    complete_ticket_parser = subparsers.add_parser(
+        "complete-ticket", help="完成维修工单"
+    )
+    complete_ticket_parser.add_argument(
+        "--ticket-id", required=True, help="工单号"
+    )
+    complete_ticket_parser.add_argument(
+        "--completed-date", required=True, help="完成日期 YYYY-MM-DD"
+    )
+
+    list_tickets_parser = subparsers.add_parser(
+        "list-tickets", help="按资产列出维修工单"
+    )
+    list_tickets_parser.add_argument(
+        "--asset-id", required=True, help="资产编号"
     )
 
     return parser
@@ -175,6 +212,67 @@ def _run_depreciation_summary(args: argparse.Namespace) -> int:
     return 0
 
 
+def _ticket_to_json(ticket: MaintenanceTicket) -> str:
+    fields = {
+        "ticket_id": ticket.ticket_id,
+        "fault_description": ticket.fault_description,
+        "submitted_date": ticket.submitted_date,
+        "status": ticket.status,
+        "completed_date": ticket.completed_date,
+    }
+    parts = [
+        f"{json.dumps(key)}: {json.dumps(value, ensure_ascii=False)}"
+        for key, value in fields.items()
+    ]
+    return "{" + ", ".join(parts) + "}"
+
+
+def _run_register_ticket(args: argparse.Namespace) -> int:
+    ticket = register_ticket(
+        ticket_id=args.ticket_id,
+        asset_id=args.asset_id,
+        fault_description=args.fault_description,
+        submitted_date=args.submitted_date,
+    )
+    print(
+        json.dumps(
+            {
+                "asset_id": ticket.asset_id,
+                "ticket_id": ticket.ticket_id,
+                "status": ticket.status,
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+def _run_complete_ticket(args: argparse.Namespace) -> int:
+    ticket = complete_ticket(
+        ticket_id=args.ticket_id,
+        completed_date=args.completed_date,
+    )
+    print(
+        json.dumps(
+            {"ticket_id": ticket.ticket_id, "status": ticket.status},
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+def _run_list_tickets(args: argparse.Namespace) -> int:
+    tickets = list_tickets(asset_id=args.asset_id)
+    records = ", ".join(_ticket_to_json(ticket) for ticket in tickets)
+    print(
+        "{"
+        f'"asset_id": {json.dumps(args.asset_id, ensure_ascii=False)}, '
+        f'"tickets": [{records}]'
+        "}"
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -188,6 +286,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_depreciation(args)
         if args.command == "depreciation-summary":
             return _run_depreciation_summary(args)
+        if args.command == "register-ticket":
+            return _run_register_ticket(args)
+        if args.command == "complete-ticket":
+            return _run_complete_ticket(args)
+        if args.command == "list-tickets":
+            return _run_list_tickets(args)
         return _run_query(args)
     except LedgerError as error:
         print(f"error: {error}", file=sys.stderr)
