@@ -9,8 +9,11 @@ from . import __version__
 from .ledger import (
     Asset,
     Depreciation,
+    DepreciationSummary,
+    DepreciationSummaryRecord,
     LedgerError,
     calculate_depreciation,
+    calculate_depreciation_summary,
     query_assets,
     register_asset,
 )
@@ -41,6 +44,13 @@ def _build_parser() -> argparse.ArgumentParser:
     depreciation.add_argument(
         "--as-of",
         help="截止日期 YYYY-MM-DD（默认系统当天）",
+    )
+
+    depreciation_summary = subparsers.add_parser(
+        "depreciation-summary", help="按整月汇总全部资产折旧"
+    )
+    depreciation_summary.add_argument(
+        "--month", required=True, help="汇总月份 YYYY-MM"
     )
 
     return parser
@@ -120,6 +130,51 @@ def _run_depreciation(args: argparse.Namespace) -> int:
     return 0
 
 
+def _summary_record_to_json(record: DepreciationSummaryRecord) -> str:
+    fields = {
+        "asset_id": record.asset_id,
+        "purchase_amount": f"{record.purchase_amount:.2f}",
+        "monthly_depreciation": f"{record.monthly_depreciation:.2f}",
+        "accumulated_depreciation": f"{record.accumulated_depreciation:.2f}",
+        "net_book_value": f"{record.net_book_value:.2f}",
+    }
+    numeric_keys = {
+        "purchase_amount",
+        "monthly_depreciation",
+        "accumulated_depreciation",
+        "net_book_value",
+    }
+    parts = [
+        f"{json.dumps(key)}: {value if key in numeric_keys else json.dumps(value, ensure_ascii=False)}"
+        for key, value in fields.items()
+    ]
+    return "{" + ", ".join(parts) + "}"
+
+
+def _summary_to_json(summary: DepreciationSummary) -> str:
+    records = ", ".join(_summary_record_to_json(r) for r in summary.records)
+    totals = (
+        "{"
+        f'"total_monthly": {summary.total_monthly:.2f}, '
+        f'"total_accumulated": {summary.total_accumulated:.2f}, '
+        f'"total_net_book_value": {summary.total_net_book_value:.2f}'
+        "}"
+    )
+    return (
+        "{"
+        f'"month": {json.dumps(summary.month)}, '
+        f'"records": [{records}], '
+        f'"totals": {totals}'
+        "}"
+    )
+
+
+def _run_depreciation_summary(args: argparse.Namespace) -> int:
+    summary = calculate_depreciation_summary(month=args.month)
+    print(_summary_to_json(summary))
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -131,6 +186,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_register(args)
         if args.command == "depreciation":
             return _run_depreciation(args)
+        if args.command == "depreciation-summary":
+            return _run_depreciation_summary(args)
         return _run_query(args)
     except LedgerError as error:
         print(f"error: {error}", file=sys.stderr)

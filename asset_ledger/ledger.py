@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import os
 from pathlib import Path
@@ -190,6 +190,28 @@ def _validate_as_of_date(value: str) -> date:
         raise LedgerError(f"as-of date is not a valid date: {value!r}") from None
 
 
+_MONTH_RE = re.compile(r"(\d{4})-(\d{2})")
+
+
+def _validate_month(value: str) -> tuple[int, int]:
+    match = _MONTH_RE.fullmatch(value or "")
+    if not match:
+        raise LedgerError(f"month must be in YYYY-MM format: {value!r}")
+    year, month = int(match.group(1)), int(match.group(2))
+    if not 1 <= month <= 12:
+        raise LedgerError(f"month is not a valid month: {value!r}")
+    return year, month
+
+
+def _month_end(year: int, month: int) -> date:
+    """Last day of the given month (the 1st of next month minus one day)."""
+    if month == 12:
+        next_month = date(year + 1, 1, 1)
+    else:
+        next_month = date(year, month + 1, 1)
+    return next_month - timedelta(days=1)
+
+
 def _elapsed_whole_months(start: date, end: date) -> int:
     """Whole months between two dates; an unfinished month is not counted."""
     months = (end.year - start.year) * 12 + (end.month - start.month)
@@ -210,6 +232,36 @@ class Depreciation:
     net_book_value: Decimal
 
 
+def _depreciation_schedule(
+    asset: Asset,
+) -> tuple[Decimal, Decimal, Decimal, Decimal]:
+    """Return (residual, depreciable total, monthly rate, purchase amount)."""
+    purchase_amount = asset.purchase_amount
+    residual_amount = (purchase_amount * RESIDUAL_RATE).quantize(
+        _TWO_PLACES, rounding=ROUND_HALF_UP
+    )
+    depreciable_amount = purchase_amount - residual_amount
+    annual_depreciation = depreciable_amount / Decimal(DEPRECIATION_YEARS)
+    monthly_depreciation = (annual_depreciation / 12).quantize(
+        _TWO_PLACES, rounding=ROUND_HALF_UP
+    )
+    return residual_amount, depreciable_amount, monthly_depreciation, purchase_amount
+
+
+def _accumulated_balance(
+    monthly_depreciation: Decimal,
+    depreciable_amount: Decimal,
+    elapsed_months: int,
+) -> Decimal:
+    """Accumulated depreciation after the given number of whole months.
+
+    Never below zero or above the total depreciable amount.
+    """
+    accumulated = monthly_depreciation * elapsed_months
+    accumulated = min(max(accumulated, Decimal("0.00")), depreciable_amount)
+    return accumulated.quantize(_TWO_PLACES, rounding=ROUND_HALF_UP)
+
+
 def calculate_depreciation(
     asset_id: str,
     as_of: str | None = None,
@@ -225,23 +277,17 @@ def calculate_depreciation(
         as_of = as_of_date.isoformat()
     else:
         as_of_date = _validate_as_of_date(as_of)
-    purchase_date = date.fromisoformat(asset.purchase_date)
 
-    purchase_amount = asset.purchase_amount
-    residual_amount = (purchase_amount * RESIDUAL_RATE).quantize(
-        _TWO_PLACES, rounding=ROUND_HALF_UP
-    )
-    depreciable_amount = purchase_amount - residual_amount
-    annual_depreciation = depreciable_amount / Decimal(DEPRECIATION_YEARS)
-    monthly_depreciation = (annual_depreciation / 12).quantize(
-        _TWO_PLACES, rounding=ROUND_HALF_UP
+    residual_amount, depreciable_amount, monthly_depreciation, purchase_amount = (
+        _depreciation_schedule(asset)
     )
 
-    elapsed_months = _elapsed_whole_months(purchase_date, as_of_date)
-    accumulated = monthly_depreciation * elapsed_months
-    # Net book value may never drop below residual or exceed purchase amount.
-    accumulated = min(max(accumulated, Decimal("0.00")), depreciable_amount)
-    accumulated = accumulated.quantize(_TWO_PLACES, rounding=ROUND_HALF_UP)
+    elapsed_months = _elapsed_whole_months(
+        date.fromisoformat(asset.purchase_date), as_of_date
+    )
+    accumulated = _accumulated_balance(
+        monthly_depreciation, depreciable_amount, elapsed_months
+    )
     net_book_value = (purchase_amount - accumulated).quantize(
         _TWO_PLACES, rounding=ROUND_HALF_UP
     )
@@ -255,4 +301,99 @@ def calculate_depreciation(
         monthly_depreciation=monthly_depreciation,
         accumulated_depreciation=accumulated,
         net_book_value=net_book_value,
+    )
+
+
+@dataclass(frozen=True)
+class DepreciationSummaryRecord:
+    asset_id: str
+    purchase_amount: Decimal
+    monthly_depreciation: Decimal
+    accumulated_depreciation: Decimal
+    net_book_value: Decimal
+
+
+@dataclass(frozen=True)
+class DepreciationSummary:
+    month: str
+    records: list[DepreciationSummaryRecord]
+    total_monthly: Decimal
+    total_accumulated: Decimal
+    total_net_book_value: Decimal
+
+
+def calculate_depreciation_summary(
+    month: str,
+    db_path: Path = DB_PATH,
+) -> DepreciationSummary:
+    """Compute straight-line depreciation for every asset for one month.
+
+    The month's last day is the cut-off for accumulated depreciation and net
+    book value. Read-only: the ledger is never modified.
+    """
+    year, month_number = _validate_month(month)
+    month_end_date = _month_end(year, month_number)
+    previous_month_end = date(year, month_number, 1) - timedelta(days=1)
+
+    records: list[DepreciationSummaryRecord] = []
+    total_monthly = Decimal("0.00")
+    total_accumulated = Decimal("0.00")
+    total_net_book_value = Decimal("0.00")
+
+    for asset in query_assets(db_path=db_path):
+        residual_amount, depreciable_amount, monthly_rate, purchase_amount = (
+            _depreciation_schedule(asset)
+        )
+        purchase_date = date.fromisoformat(asset.purchase_date)
+
+        elapsed_at_end = _elapsed_whole_months(purchase_date, month_end_date)
+        elapsed_at_start = _elapsed_whole_months(purchase_date, previous_month_end)
+        opening_accumulated = _accumulated_balance(
+            monthly_rate, depreciable_amount, elapsed_at_start
+        )
+        accumulated = _accumulated_balance(
+            monthly_rate, depreciable_amount, elapsed_at_end
+        )
+        net_book_value = (purchase_amount - accumulated).quantize(
+            _TWO_PLACES, rounding=ROUND_HALF_UP
+        )
+
+        # The month is charged only when another whole depreciation month has
+        # elapsed by its end (months before purchase, and the purchase month
+        # itself, carry no charge). The final charge is capped by the
+        # depreciable amount still open at the start of the month, so a full
+        # period is never charged twice and every month afterwards is 0.00.
+        if month_end_date < purchase_date or elapsed_at_end <= elapsed_at_start:
+            current_month_charge = Decimal("0.00")
+        else:
+            current_month_charge = min(
+                monthly_rate, depreciable_amount - opening_accumulated
+            )
+            current_month_charge = max(current_month_charge, Decimal("0.00")).quantize(
+                _TWO_PLACES, rounding=ROUND_HALF_UP
+            )
+
+        records.append(
+            DepreciationSummaryRecord(
+                asset_id=asset.asset_id,
+                purchase_amount=purchase_amount,
+                monthly_depreciation=current_month_charge,
+                accumulated_depreciation=accumulated,
+                net_book_value=net_book_value,
+            )
+        )
+        total_monthly += current_month_charge
+        total_accumulated += accumulated
+        total_net_book_value += net_book_value
+
+    return DepreciationSummary(
+        month=month,
+        records=records,
+        total_monthly=total_monthly.quantize(_TWO_PLACES, rounding=ROUND_HALF_UP),
+        total_accumulated=total_accumulated.quantize(
+            _TWO_PLACES, rounding=ROUND_HALF_UP
+        ),
+        total_net_book_value=total_net_book_value.quantize(
+            _TWO_PLACES, rounding=ROUND_HALF_UP
+        ),
     )
