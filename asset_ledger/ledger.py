@@ -35,6 +35,18 @@ CREATE TABLE IF NOT EXISTS assets (
 )
 """
 
+_MOVES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS location_moves (
+    asset_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    from_location TEXT NOT NULL,
+    to_location TEXT NOT NULL,
+    effective_date TEXT NOT NULL,
+    PRIMARY KEY (asset_id, sequence),
+    FOREIGN KEY (asset_id) REFERENCES assets (asset_id)
+)
+"""
+
 STATUS_IN_USE = "in_use"
 
 
@@ -51,6 +63,7 @@ class Asset:
     purchase_date: str
     purchase_amount: Decimal
     status: str
+    move_count: int = 0
 
 
 def _require_non_empty(field: str, value: str) -> str:
@@ -121,10 +134,11 @@ def _validate_salvage_rate(value: str) -> Decimal:
 def _connect(db_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(db_path)
     connection.execute(_SCHEMA)
+    connection.execute(_MOVES_SCHEMA)
     return connection
 
 
-def _row_to_asset(row: tuple[str, ...]) -> Asset:
+def _row_to_asset(row: tuple[object, ...]) -> Asset:
     return Asset(
         asset_id=row[0],
         name=row[1],
@@ -133,7 +147,17 @@ def _row_to_asset(row: tuple[str, ...]) -> Asset:
         purchase_date=row[4],
         purchase_amount=Decimal(row[5]),
         status=row[6],
+        move_count=row[7],
     )
+
+
+_ASSET_SELECT = (
+    "SELECT a.asset_id, a.name, a.category, a.location, a.purchase_date, "
+    "a.purchase_amount, a.status, COALESCE(m.move_count, 0) AS move_count "
+    "FROM assets a "
+    "LEFT JOIN (SELECT asset_id, COUNT(*) AS move_count "
+    "FROM location_moves GROUP BY asset_id) m ON m.asset_id = a.asset_id"
+)
 
 
 def register_asset(
@@ -187,18 +211,15 @@ def query_assets(
     clauses: list[str] = []
     parameters: list[str] = []
     if category is not None:
-        clauses.append("category = ?")
+        clauses.append("a.category = ?")
         parameters.append(category)
     if location is not None:
-        clauses.append("location = ?")
+        clauses.append("a.location = ?")
         parameters.append(location)
-    statement = (
-        "SELECT asset_id, name, category, location, purchase_date, "
-        "purchase_amount, status FROM assets"
-    )
+    statement = _ASSET_SELECT
     if clauses:
         statement += " WHERE " + " AND ".join(clauses)
-    statement += " ORDER BY asset_id ASC"
+    statement += " ORDER BY a.asset_id ASC"
     with _connect(db_path) as connection:
         rows = connection.execute(statement, parameters).fetchall()
     return [_row_to_asset(row) for row in rows]
@@ -208,11 +229,123 @@ def get_asset(asset_id: str, db_path: Path = DB_PATH) -> Asset | None:
     """Return the asset with the given id, or None if it does not exist."""
     with _connect(db_path) as connection:
         row = connection.execute(
-            "SELECT asset_id, name, category, location, purchase_date, "
-            "purchase_amount, status FROM assets WHERE asset_id = ?",
+            _ASSET_SELECT + " WHERE a.asset_id = ?",
             (asset_id,),
         ).fetchone()
     return _row_to_asset(row) if row is not None else None
+
+
+@dataclass(frozen=True)
+class MoveRecord:
+    asset_id: str
+    sequence: int
+    from_location: str
+    to_location: str
+    effective_date: str
+
+
+def move_asset(
+    asset_id: str,
+    to_location: str,
+    effective_date: str,
+    db_path: Path = DB_PATH,
+) -> MoveRecord:
+    """Record a location change for an asset and update its current location.
+
+    The location update and the change fact are written in one transaction:
+    either both are committed or neither is. Raises LedgerError on any
+    validation failure, unknown asset, or a no-op (same-location) move.
+    """
+    target = _require_non_empty("to location", to_location).strip()
+    move_date = _validate_calendar_date("effective date", effective_date)
+
+    with _connect(db_path) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT location, purchase_date FROM assets WHERE asset_id = ?",
+                (asset_id,),
+            ).fetchone()
+            if row is None:
+                raise LedgerError(f"asset id not found: {asset_id!r}")
+            current_location = row[0]
+            purchase_day = date.fromisoformat(row[1])
+            if move_date < purchase_day:
+                raise LedgerError(
+                    f"effective date must not be earlier than purchase date "
+                    f"{row[1]}: {effective_date!r}"
+                )
+            if target == current_location:
+                raise LedgerError(
+                    f"target location is the same as the current location: "
+                    f"{target!r}"
+                )
+            next_row = connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM location_moves "
+                "WHERE asset_id = ?",
+                (asset_id,),
+            ).fetchone()
+            sequence = next_row[0]
+            connection.execute(
+                "UPDATE assets SET location = ? WHERE asset_id = ?",
+                (target, asset_id),
+            )
+            connection.execute(
+                "INSERT INTO location_moves (asset_id, sequence, from_location, "
+                "to_location, effective_date) VALUES (?, ?, ?, ?, ?)",
+                (
+                    asset_id,
+                    sequence,
+                    current_location,
+                    target,
+                    effective_date,
+                ),
+            )
+        except Exception:
+            connection.rollback()
+            raise
+        else:
+            connection.commit()
+
+    return MoveRecord(
+        asset_id=asset_id,
+        sequence=sequence,
+        from_location=current_location,
+        to_location=target,
+        effective_date=effective_date,
+    )
+
+
+def list_moves(
+    asset_id: str,
+    db_path: Path = DB_PATH,
+) -> list[MoveRecord]:
+    """Return all location-change facts for an asset, ordered by sequence.
+
+    Raises LedgerError if the asset is not registered.
+    """
+    with _connect(db_path) as connection:
+        exists = connection.execute(
+            "SELECT 1 FROM assets WHERE asset_id = ?", (asset_id,)
+        ).fetchone()
+        if exists is None:
+            raise LedgerError(f"asset id not found: {asset_id!r}")
+        rows = connection.execute(
+            "SELECT asset_id, sequence, from_location, to_location, "
+            "effective_date FROM location_moves WHERE asset_id = ? "
+            "ORDER BY sequence ASC",
+            (asset_id,),
+        ).fetchall()
+    return [
+        MoveRecord(
+            asset_id=row[0],
+            sequence=row[1],
+            from_location=row[2],
+            to_location=row[3],
+            effective_date=row[4],
+        )
+        for row in rows
+    ]
 
 
 @dataclass(frozen=True)

@@ -315,5 +315,216 @@ class DepreciationTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
 
 
+class MoveTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.db_path = Path(self._tmpdir.name) / "asset_ledger.db"
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        env = dict(os.environ, ASSET_LEDGER_DB=str(self.db_path))
+        return subprocess.run(
+            [sys.executable, "-m", "asset_ledger", *arguments],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def register(self, asset_id: str = "A001", location: str = "办公室",
+                 purchase_date: str = "2026-09-25") -> None:
+        result = self.invoke(
+            "register",
+            "--asset-id", asset_id,
+            "--name", "电脑",
+            "--category", "办公设备",
+            "--location", location,
+            "--purchase-date", purchase_date,
+            "--purchase-amount", "8999.00",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def move(self, to_location: str, effective_date: str = "2027-01-15",
+             asset_id: str = "A001") -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            "move",
+            "--asset-id", asset_id,
+            "--to-location", to_location,
+            "--effective-date", effective_date,
+        )
+
+    def moves(self, asset_id: str = "A001") -> list[dict[str, object]]:
+        result = self.invoke("moves", "--asset-id", asset_id)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        return json.loads(result.stdout)["records"]
+
+    def query_records(self, *arguments: str) -> list[dict[str, object]]:
+        result = self.invoke("query", *arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)["records"]
+
+    def test_successful_move_output_and_sequence(self) -> None:
+        self.register()
+        result = self.move("仓库C")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "asset_id": "A001",
+                "from_location": "办公室",
+                "to_location": "仓库C",
+                "effective_date": "2027-01-15",
+                "sequence": 1,
+            },
+        )
+
+    def test_query_reflects_current_location_and_move_count(self) -> None:
+        self.register()
+        self.assertEqual(self.query_records()[0]["move_count"], 0)
+        self.move("仓库C")
+        records = self.query_records()
+        self.assertEqual(records[0]["location"], "仓库C")
+        self.assertEqual(records[0]["move_count"], 1)
+        self.assertEqual(
+            [r["asset_id"] for r in self.query_records("--location", "办公室")],
+            [],
+        )
+        self.assertEqual(
+            [r["asset_id"] for r in self.query_records("--location", "仓库C")],
+            ["A001"],
+        )
+
+    def test_moves_lists_facts_in_sequence_order(self) -> None:
+        self.register()
+        self.move("仓库C", "2027-01-15")
+        self.move("实验室B", "2027-03-01")
+        self.assertEqual(
+            self.moves(),
+            [
+                {
+                    "from_location": "办公室",
+                    "to_location": "仓库C",
+                    "effective_date": "2027-01-15",
+                    "sequence": 1,
+                },
+                {
+                    "from_location": "仓库C",
+                    "to_location": "实验室B",
+                    "effective_date": "2027-03-01",
+                    "sequence": 2,
+                },
+            ],
+        )
+
+    def test_repeated_moves_on_same_date_get_consecutive_sequences(self) -> None:
+        self.register()
+        first = self.move("仓库C", "2027-01-15")
+        second = self.move("实验室B", "2027-01-15")
+        self.assertEqual(json.loads(first.stdout)["sequence"], 1)
+        self.assertEqual(json.loads(second.stdout)["sequence"], 2)
+        records = self.query_records()
+        self.assertEqual(records[0]["location"], "实验室B")
+        self.assertEqual(records[0]["move_count"], 2)
+
+    def test_move_back_to_old_location_is_recorded(self) -> None:
+        self.register()
+        self.move("仓库C")
+        back = self.move("办公室")
+        self.assertEqual(back.returncode, 0, back.stderr)
+        self.assertEqual(json.loads(back.stdout)["sequence"], 2)
+        records = self.moves()
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[1]["from_location"], "仓库C")
+        self.assertEqual(records[1]["to_location"], "办公室")
+        self.assertEqual(self.query_records()[0]["location"], "办公室")
+
+    def test_move_on_purchase_date_is_allowed(self) -> None:
+        self.register(purchase_date="2026-09-25")
+        result = self.move("仓库C", effective_date="2026-09-25")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["sequence"], 1)
+
+    def test_failed_validation_leaves_no_partial_fact(self) -> None:
+        self.register()
+        bad_calls = [
+            {"to_location": "   "},
+            {"to_location": ""},
+            {"effective_date": "2027/01/15"},
+            {"effective_date": "2027-02-30"},
+            {"effective_date": "2026-09-24"},
+            {"to_location": "办公室"},
+        ]
+        for overrides in bad_calls:
+            with self.subTest(overrides=overrides):
+                result = self.move(
+                    overrides.get("to_location", "仓库C"),
+                    overrides.get("effective_date", "2027-01-15"),
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                self.assertNotEqual(result.stderr, "")
+        record = self.query_records()[0]
+        self.assertEqual(record["location"], "办公室")
+        self.assertEqual(record["move_count"], 0)
+        self.assertEqual(self.moves(), [])
+
+    def test_move_unknown_asset_is_rejected(self) -> None:
+        self.register()
+        result = self.move("仓库C", asset_id="NOPE")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertNotEqual(result.stderr, "")
+        # 已登记资产不受影响
+        self.assertEqual(self.query_records()[0]["move_count"], 0)
+
+    def test_moves_unknown_asset_is_rejected(self) -> None:
+        result = self.invoke("moves", "--asset-id", "NOPE")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertNotEqual(result.stderr, "")
+
+    def test_missing_required_argument_is_an_error(self) -> None:
+        self.register()
+        result = self.invoke(
+            "move", "--asset-id", "A001", "--to-location", "仓库C"
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotEqual(result.stderr, "")
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.moves(), [])
+
+    def test_location_whitespace_is_trimmed(self) -> None:
+        self.register()
+        result = self.move("  仓库C  ")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = json.loads(result.stdout)
+        self.assertEqual(line["to_location"], "仓库C")
+        self.assertEqual(self.query_records()[0]["location"], "仓库C")
+
+    def test_depreciate_output_unchanged_after_move(self) -> None:
+        self.register()
+        result = self.invoke(
+            "depreciate",
+            "--asset-id", "A001",
+            "--as-of", "2027-09-25",
+            "--useful-life-years", "5",
+            "--salvage-rate", "0.10",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        before = result.stdout
+        self.move("仓库C")
+        result = self.invoke(
+            "depreciate",
+            "--asset-id", "A001",
+            "--as-of", "2027-09-25",
+            "--useful-life-years", "5",
+            "--salvage-rate", "0.10",
+        )
+        self.assertEqual(result.stdout, before)
+
+
 if __name__ == "__main__":
     unittest.main()
