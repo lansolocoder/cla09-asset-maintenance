@@ -7,7 +7,10 @@
 ```bash
 python3 -m asset_ledger --help
 python3 -m asset_ledger --version
+python3 -m asset_ledger asset add --id A001 --name 笔记本 --cost 8000 --purchased-at 2026-09-26
+python3 -m asset_ledger asset status --id A001 --to repairing --reason 换屏
+python3 -m asset_ledger asset show --id A001
 python3 -m unittest discover -s tests -v
 ```
 
-当前仅提供帮助与版本查询入口；无参数显示帮助，未知参数以非零状态退出。尚未实现资产登记、维保计划、部件更换记录以及折旧计算，不会创建业务数据文件。
+资产数据持久化在仓库根目录的 `ledger.db`（SQLite）。`asset add` 登记资产并置为 `in_use`；`asset status` 仅允许 in_use↔repairing 以及任一在用状态→retired（转 retired 须给 `--reason`）；`asset show` 输出含完整状态变更历史的一行 JSON。编号唯一且不复用，每次变更追加记录，不改动历史。无参数显示帮助，未知参数以非零状态退出。
