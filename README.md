@@ -10,4 +10,13 @@ python3 -m asset_ledger --version
 python3 -m unittest discover -s tests -v
 ```
 
-当前仅提供帮助与版本查询入口；无参数显示帮助，未知参数以非零状态退出。尚未实现资产登记、维保计划、部件更换记录以及折旧计算，不会创建业务数据文件。
+支持资产登记与状态流转，数据持久化在仓库根目录的 `ledger.db`（SQLite，仅追加事件、不改写历史）：
+
+```bash
+python3 -m asset_ledger asset add --id A001 --name 投影仪 --cost 3200 --purchased-at 2026-09-01
+python3 -m asset_ledger asset status --id A001 --to repairing
+python3 -m asset_ledger asset status --id A001 --to retired --reason 报废
+python3 -m asset_ledger asset show --id A001   # 输出一行 JSON，含按发生顺序的完整 history
+```
+
+合法状态转换为 `in_use→repairing`、`repairing→in_use`、`in_use/repairing→retired`；`retired` 为终态。无参数显示帮助，未知参数以非零状态退出。
