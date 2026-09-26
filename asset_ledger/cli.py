@@ -6,7 +6,15 @@ import json
 import sys
 
 from . import __version__
-from .ledger import Asset, LedgerError, depreciate_asset, query_assets, register_asset
+from .ledger import (
+    Asset,
+    LedgerError,
+    depreciate_asset,
+    list_moves,
+    move_asset,
+    query_assets,
+    register_asset,
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -28,6 +36,14 @@ def _build_parser() -> argparse.ArgumentParser:
     query = subparsers.add_parser("query", help="查询资产台账")
     query.add_argument("--category", help="按分类过滤")
     query.add_argument("--location", help="按存放位置过滤")
+
+    move = subparsers.add_parser("move", help="变更资产存放位置")
+    move.add_argument("--asset-id", required=True, help="资产编号")
+    move.add_argument("--to-location", required=True, help="新存放位置")
+    move.add_argument("--effective-date", required=True, help="生效日期 YYYY-MM-DD")
+
+    moves = subparsers.add_parser("moves", help="列出资产的存放位置变更事实")
+    moves.add_argument("--asset-id", required=True, help="资产编号")
 
     depreciate = subparsers.add_parser(
         "depreciate", help="按直线法计算资产折旧与账面价值"
@@ -55,6 +71,7 @@ def _asset_to_json(asset: Asset) -> str:
     }
     parts = [f"{json.dumps(key)}: {json.dumps(value, ensure_ascii=False)}" for key, value in fields.items()]
     parts.insert(5, f'"purchase_amount": {asset.purchase_amount:.2f}')
+    parts.append(f'"move_count": {asset.move_count}')
     return "{" + ", ".join(parts) + "}"
 
 
@@ -80,6 +97,38 @@ def _run_query(args: argparse.Namespace) -> int:
     assets = query_assets(category=args.category, location=args.location)
     records = ", ".join(_asset_to_json(asset) for asset in assets)
     print('{"records": [' + records + "]}")
+    return 0
+
+
+def _run_move(args: argparse.Namespace) -> int:
+    record = move_asset(
+        asset_id=args.asset_id,
+        to_location=args.to_location,
+        effective_date=args.effective_date,
+    )
+    line = {
+        "asset_id": record.asset_id,
+        "from_location": record.from_location,
+        "to_location": record.to_location,
+        "effective_date": record.effective_date,
+        "sequence": record.sequence,
+    }
+    print(json.dumps(line, ensure_ascii=False))
+    return 0
+
+
+def _run_moves(args: argparse.Namespace) -> int:
+    records = list_moves(asset_id=args.asset_id)
+    lines = [
+        "{"
+        f'"from_location": {json.dumps(record.from_location, ensure_ascii=False)}, '
+        f'"to_location": {json.dumps(record.to_location, ensure_ascii=False)}, '
+        f'"effective_date": {json.dumps(record.effective_date, ensure_ascii=False)}, '
+        f'"sequence": {record.sequence}'
+        "}"
+        for record in records
+    ]
+    print('{"records": [' + ", ".join(lines) + "]}")
     return 0
 
 
@@ -113,6 +162,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "register":
             return _run_register(args)
+        if args.command == "move":
+            return _run_move(args)
+        if args.command == "moves":
+            return _run_moves(args)
         if args.command == "depreciate":
             return _run_depreciate(args)
         return _run_query(args)
