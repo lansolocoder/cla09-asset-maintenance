@@ -2,7 +2,7 @@
 
 import argparse
 from collections.abc import Sequence
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 import json
 import os
@@ -44,6 +44,12 @@ CREATE TABLE IF NOT EXISTS events (
     status TEXT NOT NULL,
     reason TEXT
 );
+CREATE TABLE IF NOT EXISTS plans (
+    id TEXT PRIMARY KEY,
+    asset_id TEXT NOT NULL REFERENCES assets(id),
+    cycle_days INTEGER NOT NULL,
+    first_due TEXT NOT NULL
+);
 """
 
 _DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -83,6 +89,42 @@ def _parse_purchased_at(text: str) -> str:
     if purchased > date.today():
         raise LedgerError(f"purchased-at date is in the future: {text!r}")
     return text
+
+
+def _parse_date(text: str, label: str) -> date:
+    if not _DATE_PATTERN.fullmatch(text):
+        raise LedgerError(f"invalid {label} date: {text!r} (expected YYYY-MM-DD)")
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        raise LedgerError(f"invalid {label} date: {text!r}") from None
+
+
+def _parse_first_due(text: str) -> str:
+    first_due = _parse_date(text, "first-due")
+    if first_due > date.today():
+        raise LedgerError(f"first-due date is in the future: {text!r}")
+    return text
+
+
+def _parse_cycle_days(text: str) -> int:
+    try:
+        days = int(text)
+    except ValueError:
+        raise LedgerError(
+            f"invalid cycle days: {text!r} (expected a positive integer)"
+        ) from None
+    if days <= 0:
+        raise LedgerError(f"invalid cycle days: {text!r} (expected a positive integer)")
+    return days
+
+
+def _next_due_date(first_due: date, cycle_days: int, today: date) -> date:
+    """Roll ``first_due`` forward by whole cycles to the first date not yet
+    consumed, i.e. the smallest due date on or after ``today``."""
+    elapsed = (today - first_due).days
+    cycles = max(0, -(-elapsed // cycle_days))  # ceil division, never negative
+    return first_due + timedelta(days=cycles * cycle_days)
 
 
 def _cost_as_number(text: str) -> int | float:
@@ -194,6 +236,71 @@ def _cmd_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_plan_add(args: argparse.Namespace) -> int:
+    cycle_days = _parse_cycle_days(args.cycle_days)
+    first_due = _parse_first_due(args.first_due)
+    if not DB_PATH.exists():
+        raise LedgerError(f"asset {args.asset_id} not found")
+    conn = _connect()
+    try:
+        with conn:  # rolls back if any check raises
+            if not conn.execute(
+                "SELECT 1 FROM assets WHERE id = ?", (args.asset_id,)
+            ).fetchone():
+                raise LedgerError(f"asset {args.asset_id} not found")
+            if conn.execute(
+                "SELECT 1 FROM plans WHERE id = ?", (args.id,)
+            ).fetchone():
+                raise LedgerError(f"plan {args.id} already exists")
+            try:
+                conn.execute(
+                    "INSERT INTO plans (id, asset_id, cycle_days, first_due)"
+                    " VALUES (?, ?, ?, ?)",
+                    (args.id, args.asset_id, cycle_days, first_due),
+                )
+            except sqlite3.IntegrityError:
+                raise LedgerError(f"plan {args.id} already exists") from None
+    finally:
+        conn.close()
+    print(f"plan {args.id} created")
+    return 0
+
+
+def _cmd_plan_due(args: argparse.Namespace) -> int:
+    as_of = _parse_date(args.as_of, "as-of")
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, asset_id, cycle_days, first_due FROM plans"
+        ).fetchall()
+        statuses = {
+            asset_id: _current_status(conn, asset_id)
+            for asset_id in {row[1] for row in rows}
+        }
+    finally:
+        conn.close()
+    today = date.today()
+    due = []
+    for plan_id, asset_id, cycle_days, first_due in rows:
+        status = statuses[asset_id]
+        if status == "retired":
+            continue  # retired assets never appear in the due list
+        next_due = _next_due_date(date.fromisoformat(first_due), cycle_days, today)
+        if next_due > as_of:
+            continue
+        due.append(
+            {
+                "plan_id": plan_id,
+                "asset_id": asset_id,
+                "due_date": next_due.isoformat(),
+                "asset_status": status,
+            }
+        )
+    due.sort(key=lambda entry: (entry["due_date"], entry["plan_id"]))
+    print(json.dumps({"as_of": args.as_of, "due": due}, ensure_ascii=False))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="asset-ledger",
@@ -221,6 +328,30 @@ def build_parser() -> argparse.ArgumentParser:
     show = asset_subparsers.add_parser("show", help="show one asset as JSON")
     show.add_argument("--id", required=True, help="asset identifier")
     show.set_defaults(handler=_cmd_show)
+
+    plan = subparsers.add_parser("plan", help="manage periodic maintenance plans")
+    plan_subparsers = plan.add_subparsers(dest="plan_command")
+
+    plan_add = plan_subparsers.add_parser(
+        "add", help="register a maintenance plan for an asset"
+    )
+    plan_add.add_argument("--id", required=True, help="unique plan identifier")
+    plan_add.add_argument("--asset-id", required=True, help="asset to maintain")
+    plan_add.add_argument(
+        "--cycle-days", required=True, help="maintenance cycle in days, positive integer"
+    )
+    plan_add.add_argument(
+        "--first-due",
+        required=True,
+        help="first due date, YYYY-MM-DD, not later than today",
+    )
+    plan_add.set_defaults(handler=_cmd_plan_add)
+
+    due = plan_subparsers.add_parser(
+        "due", help="list plans whose next due date falls on or before a cutoff"
+    )
+    due.add_argument("--as-of", required=True, help="cutoff date, YYYY-MM-DD")
+    due.set_defaults(handler=_cmd_plan_due)
 
     return parser
 
