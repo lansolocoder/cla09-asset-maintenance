@@ -344,5 +344,208 @@ class DepreciationTests(unittest.TestCase):
         self.assertEqual(row, [("A001", "in_use")])
 
 
+class MaintenancePlanTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.db_path = Path(self._tmpdir.name) / "asset_ledger.db"
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        env = dict(os.environ, ASSET_LEDGER_DB=str(self.db_path))
+        return subprocess.run(
+            [sys.executable, "-m", "asset_ledger", *arguments],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def register_asset(self, asset_id: str = "A001", **overrides: str) -> None:
+        fields = {
+            "asset-id": asset_id,
+            "name": "电脑",
+            "category": "办公设备",
+            "location": "办公室",
+            "purchase-date": "2026-09-25",
+            "purchase-amount": "8999.00",
+        }
+        fields.update(overrides)
+        arguments = ["register"]
+        for key, value in fields.items():
+            arguments += [f"--{key}", value]
+        result = self.invoke(*arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def plan(self, *arguments: str, **fields: str) -> subprocess.CompletedProcess[str]:
+        defaults = {
+            "asset-id": "A001",
+            "plan-id": "P001",
+            "item": "年度校准",
+            "cycle-days": "90",
+            "next-due": "2027-01-01",
+        }
+        defaults.update(fields)
+        arguments = ("plan",) + arguments
+        for key, value in defaults.items():
+            arguments += (f"--{key}", value)
+        return self.invoke(*arguments)
+
+    def due_records(self, start: str, end: str) -> list[dict[str, object]]:
+        result = self.invoke("due", "--start", start, "--end", end)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        return json.loads(result.stdout)["records"]
+
+    def test_register_plan_round_trip(self) -> None:
+        self.register_asset()
+        result = self.plan()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "plan_id": "P001",
+                "asset_id": "A001",
+                "item": "年度校准",
+                "cycle_days": 90,
+                "next_due": "2027-01-01",
+            },
+        )
+
+    def test_multiple_plans_per_asset(self) -> None:
+        self.register_asset()
+        self.assertEqual(self.plan(**{"plan-id": "P001", "item": "年度校准"}).returncode, 0)
+        result = self.plan(**{"plan-id": "P002", "item": "季度巡检"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_due_date_on_purchase_date_is_allowed(self) -> None:
+        self.register_asset()
+        result = self.plan(**{"next-due": "2026-09-25"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_due_recurrence_picks_earliest_occurrence_in_window(self) -> None:
+        self.register_asset()
+        # First due 2027-01-01, every 30 days.
+        self.plan(**{"cycle-days": "30"})
+        # Window starts well after the first due: 2027-02-15 .. 2027-03-15
+        # occurrences: 01-01, 01-31, 03-02 -> earliest in window is 03-02.
+        records = self.due_records("2027-02-15", "2027-03-15")
+        self.assertEqual([r["due_date"] for r in records], ["2027-03-02"])
+        self.assertEqual(
+            records[0],
+            {
+                "plan_id": "P001",
+                "asset_id": "A001",
+                "item": "年度校准",
+                "cycle_days": 30,
+                "due_date": "2027-03-02",
+            },
+        )
+        # Window entirely before the first due matches the first due.
+        records = self.due_records("2026-12-01", "2027-01-01")
+        self.assertEqual([r["due_date"] for r in records], ["2027-01-01"])
+
+    def test_due_orders_by_date_then_plan_id(self) -> None:
+        self.register_asset()
+        self.register_asset("A002")
+        # Register in an order that would sort wrongly without the ORDER BY.
+        self.plan(**{"plan-id": "P002", "asset-id": "A002",
+                     "item": "保养", "cycle-days": "100", "next-due": "2027-01-15"})
+        self.plan(**{"plan-id": "P001", "asset-id": "A001",
+                     "item": "校准", "cycle-days": "100", "next-due": "2027-01-05"})
+        records = self.due_records("2027-01-01", "2027-01-31")
+        self.assertEqual(
+            [(r["due_date"], r["plan_id"]) for r in records],
+            [("2027-01-05", "P001"), ("2027-01-15", "P002")],
+        )
+
+    def test_due_same_day_orders_by_plan_id(self) -> None:
+        self.register_asset()
+        self.register_asset("A002")
+        self.plan(**{"plan-id": "P002", "asset-id": "A002",
+                     "item": "保养", "cycle-days": "100", "next-due": "2027-01-05"})
+        self.plan(**{"plan-id": "P001", "asset-id": "A001",
+                     "item": "校准", "cycle-days": "100", "next-due": "2027-01-05"})
+        records = self.due_records("2027-01-01", "2027-01-31")
+        self.assertEqual(
+            [(r["due_date"], r["plan_id"]) for r in records],
+            [("2027-01-05", "P001"), ("2027-01-05", "P002")],
+        )
+
+    def test_due_empty_window(self) -> None:
+        self.register_asset()
+        self.plan()
+        result = self.invoke("due", "--start", "2030-01-01", "--end", "2030-02-01")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), '{"records": []}')
+
+    def test_due_empty_database(self) -> None:
+        result = self.invoke("due", "--start", "2026-01-01", "--end", "2026-12-31")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), '{"records": []}')
+
+    def test_plan_errors(self) -> None:
+        self.register_asset()
+        self.assertEqual(self.plan().returncode, 0)
+        bad_calls = [
+            {"plan-id": "P001"},  # duplicate plan id (different item)
+            {"item": "年度校准"},  # duplicate asset + item (different plan id)
+            {"asset-id": "A404"},  # unknown asset
+            {"plan-id": ""},
+            {"asset-id": ""},
+            {"item": ""},
+            {"cycle-days": "0"},
+            {"cycle-days": "-90"},
+            {"cycle-days": "1.5"},
+            {"cycle-days": "abc"},
+            {"next-due": "2026-09-24"},  # before purchase date
+            {"next-due": "2027/01/01"},
+            {"next-due": "2027-02-30"},
+        ]
+        for overrides in bad_calls:
+            with self.subTest(overrides=overrides):
+                result = self.plan(**{"plan-id": "P009", "item": "其他项目",
+                                      **overrides})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotEqual(result.stderr, "")
+                self.assertEqual(result.stdout, "")
+        with sqlite3.connect(self.db_path) as connection:
+            rows = connection.execute(
+                "SELECT plan_id, item FROM maintenance_plans"
+            ).fetchall()
+        self.assertEqual(rows, [("P001", "年度校准")])
+
+    def test_plan_for_unknown_asset_does_not_create_table_garbage(self) -> None:
+        # No asset registered at all: unknown asset error, plans table empty.
+        result = self.plan(**{"asset-id": "A404"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        with sqlite3.connect(self.db_path) as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM maintenance_plans"
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_due_invalid_ranges(self) -> None:
+        bad_ranges = [
+            ("2027/01/01", "2027-02-01"),
+            ("2027-01-01", "2027-02-30"),
+            ("2027-03-01", "2027-02-01"),  # start after end
+        ]
+        for start, end in bad_ranges:
+            with self.subTest(range=(start, end)):
+                result = self.invoke("due", "--start", start, "--end", end)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotEqual(result.stderr, "")
+                self.assertEqual(result.stdout, "")
+
+    def test_missing_required_argument_is_an_error(self) -> None:
+        result = self.invoke("plan", "--asset-id", "A001", "--plan-id", "P001")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotEqual(result.stderr, "")
+        self.assertEqual(result.stdout, "")
+
+
 if __name__ == "__main__":
     unittest.main()

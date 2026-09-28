@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import os
 from pathlib import Path
@@ -28,6 +28,14 @@ CREATE TABLE IF NOT EXISTS assets (
     purchase_date TEXT NOT NULL,
     purchase_amount TEXT NOT NULL,
     status TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS maintenance_plans (
+    plan_id TEXT PRIMARY KEY,
+    asset_id TEXT NOT NULL REFERENCES assets(asset_id),
+    item TEXT NOT NULL,
+    cycle_days INTEGER NOT NULL,
+    next_due TEXT NOT NULL,
+    UNIQUE(asset_id, item)
 )
 """
 
@@ -47,6 +55,15 @@ class Asset:
     purchase_date: str
     purchase_amount: Decimal
     status: str
+
+
+@dataclass(frozen=True)
+class MaintenancePlan:
+    plan_id: str
+    asset_id: str
+    item: str
+    cycle_days: int
+    next_due: str
 
 
 def _require_non_empty(field: str, value: str) -> str:
@@ -99,9 +116,18 @@ def _validate_amount(value: str) -> Decimal:
     return amount.quantize(Decimal("0.01"))
 
 
+def _validate_cycle_days(value: str) -> int:
+    if not re.fullmatch(r"\d+", value or ""):
+        raise LedgerError(f"cycle days must be a positive integer: {value!r}")
+    cycle_days = int(value)
+    if cycle_days <= 0:
+        raise LedgerError(f"cycle days must be a positive integer: {value!r}")
+    return cycle_days
+
+
 def _connect(db_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(db_path)
-    connection.execute(_SCHEMA)
+    connection.executescript(_SCHEMA)
     return connection
 
 
@@ -233,4 +259,113 @@ def calculate_depreciation(
         "accumulated_depreciation": accumulated,
         "net_value": net_value,
     }
+
+
+def register_plan(
+    plan_id: str,
+    asset_id: str,
+    item: str,
+    cycle_days: str,
+    next_due: str,
+    db_path: Path = DB_PATH,
+) -> MaintenancePlan:
+    """Validate and store a maintenance plan; raise LedgerError on violation."""
+    plan_id = _require_non_empty("plan id", plan_id)
+    asset_id = _require_non_empty("asset id", asset_id)
+    item = _require_non_empty("item", item)
+    cycle = _validate_cycle_days(cycle_days)
+    due = _parse_date(next_due)
+    with _connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT purchase_date FROM assets WHERE asset_id = ?",
+            (asset_id,),
+        ).fetchone()
+        if row is None:
+            raise LedgerError(f"unknown asset id: {asset_id!r}")
+        purchase_date = date.fromisoformat(row[0])
+        if due < purchase_date:
+            raise LedgerError(
+                f"first due date {next_due!r} is before the purchase date "
+                f"{row[0]!r}"
+            )
+        plan = MaintenancePlan(
+            plan_id=plan_id,
+            asset_id=asset_id,
+            item=item,
+            cycle_days=cycle,
+            next_due=due.isoformat(),
+        )
+        if connection.execute(
+            "SELECT 1 FROM maintenance_plans WHERE plan_id = ?",
+            (plan.plan_id,),
+        ).fetchone():
+            raise LedgerError(f"plan id already registered: {plan_id!r}")
+        if connection.execute(
+            "SELECT 1 FROM maintenance_plans WHERE asset_id = ? AND item = ?",
+            (plan.asset_id, plan.item),
+        ).fetchone():
+            raise LedgerError(
+                f"maintenance item already registered for asset "
+                f"{plan.asset_id!r}: {plan.item!r}"
+            )
+        connection.execute(
+            "INSERT INTO maintenance_plans (plan_id, asset_id, item, "
+            "cycle_days, next_due) VALUES (?, ?, ?, ?, ?)",
+            (
+                plan.plan_id,
+                plan.asset_id,
+                plan.item,
+                plan.cycle_days,
+                plan.next_due,
+            ),
+        )
+    return plan
+
+
+def query_due(
+    start: str,
+    end: str,
+    db_path: Path = DB_PATH,
+) -> list[dict[str, object]]:
+    """Return the earliest due occurrence of each plan within [start, end].
+
+    Due dates recur every ``cycle_days`` from the plan's first due date; only
+    the earliest occurrence inside the window is reported. Results are ordered
+    by due date then plan id.
+    """
+    start_date = _parse_date(start)
+    end_date = _parse_date(end)
+    if start_date > end_date:
+        raise LedgerError(
+            f"start date {start!r} is after end date {end!r}"
+        )
+    with _connect(db_path) as connection:
+        rows = connection.execute(
+            "SELECT plan_id, asset_id, item, cycle_days, next_due "
+            "FROM maintenance_plans"
+        ).fetchall()
+    records: list[dict[str, object]] = []
+    for plan_id, asset_id, item, cycle_days, first_due in rows:
+        first = date.fromisoformat(first_due)
+        if first > end_date:
+            continue
+        if first >= start_date:
+            due = first
+        else:
+            periods = (start_date - first).days // cycle_days
+            due = first + timedelta(days=cycle_days * periods)
+            if due < start_date:
+                due += timedelta(days=cycle_days)
+        if due <= end_date:
+            records.append(
+                {
+                    "plan_id": plan_id,
+                    "asset_id": asset_id,
+                    "item": item,
+                    "cycle_days": cycle_days,
+                    "due_date": due.isoformat(),
+                }
+            )
+    records.sort(key=lambda record: (record["due_date"], record["plan_id"]))
+    return records
 

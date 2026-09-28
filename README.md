@@ -40,4 +40,26 @@ python3 -m asset_ledger depreciate --asset-id A001 --as-of 2027-09-25 --annual-r
 
 成功时退出码为 0，stdout 输出一行 JSON：`{"asset_id": "A001", "as_of": "2027-09-25", "purchase_amount": 8999.00, "annual_rate": 5.0, "accumulated_depreciation": 449.95, "net_value": 8549.05}`，其中金额字段为保留两位小数的数字，`annual_rate` 为数字。评估日期早于购置日期、非法日期、非法折旧率（非数字、负数、超过 100）、未知资产编号均为业务错误（退出码非 0，错误写 stderr，stdout 为空，库中记录不变）。
 
-数据持久化在仓库根目录的 `asset_ledger.db`（SQLite），文件不存在时自动创建。尚未实现维保计划与部件更换记录。
+数据持久化在仓库根目录的 `asset_ledger.db`（SQLite），文件不存在时自动创建。
+
+## 维保计划登记
+
+```bash
+python3 -m asset_ledger plan \
+    --asset-id A001 --plan-id P001 --item 年度校准 \
+    --cycle-days 90 --next-due 2027-01-01
+```
+
+为已登记资产登记一项维保计划。计划编号是业务唯一键；同一资产可登记多项计划，但同一资产同一维保项目名称不得重复登记。`--cycle-days` 为正整数，表示每两次维保的间隔天数；首次到期日期必须是合法的 `YYYY-MM-DD`，且不得早于该资产的购置日期。资产编号、计划编号、维保项目名称均不得为空。登记成功退出码为 0，stdout 输出一行 JSON：`{"plan_id": "P001", "asset_id": "A001", "item": "年度校准", "cycle_days": 90, "next_due": "2027-01-01"}`。
+
+## 维保到期提醒查询
+
+```bash
+python3 -m asset_ledger due --start 2026-12-01 --end 2027-03-31
+```
+
+输入开始日期与结束日期（均为合法 `YYYY-MM-DD`，开始不晚于结束），输出区间内到期的全部计划：每条计划按首次到期日期起逐次加周期天数推算，只输出落在区间内的最早一次到期日期。结果按 `due_date` 升序、同日再按 `plan_id` 升序输出为 JSON：`{"records": [...]}`，每条记录含 `plan_id`、`asset_id`、`item`、`cycle_days`、`due_date`。无匹配时 `records` 为空数组，退出码仍为 0。
+
+计划编号重复、同一资产同一维保项目重复、未知资产编号、空字段、非法或早于购置日期的到期日期、非法周期天数（非正整数）均为业务错误；区间起止非法同理（退出码非 0，错误写 stderr，stdout 为空，库中记录不变）。
+
+尚未实现部件更换记录。

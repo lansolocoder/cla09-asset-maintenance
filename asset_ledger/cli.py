@@ -11,7 +11,9 @@ from .ledger import (
     LedgerError,
     calculate_depreciation,
     query_assets,
+    query_due,
     register_asset,
+    register_plan,
 )
 
 
@@ -43,6 +45,17 @@ def _build_parser() -> argparse.ArgumentParser:
     depreciate.add_argument(
         "--annual-rate", required=True, help="年折旧率（百分数，如 5 或 2.5）"
     )
+
+    plan = subparsers.add_parser("plan", help="为资产登记维保计划")
+    plan.add_argument("--asset-id", required=True, help="资产编号")
+    plan.add_argument("--plan-id", required=True, help="计划编号（业务唯一键）")
+    plan.add_argument("--item", required=True, help="维保项目名称")
+    plan.add_argument("--cycle-days", required=True, help="维保周期天数（正整数）")
+    plan.add_argument("--next-due", required=True, help="首次到期日期 YYYY-MM-DD")
+
+    due = subparsers.add_parser("due", help="按到期区间查询维保提醒")
+    due.add_argument("--start", required=True, help="区间开始日期 YYYY-MM-DD")
+    due.add_argument("--end", required=True, help="区间结束日期 YYYY-MM-DD")
 
     return parser
 
@@ -106,6 +119,31 @@ def _run_depreciate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_plan(args: argparse.Namespace) -> int:
+    plan = register_plan(
+        plan_id=args.plan_id,
+        asset_id=args.asset_id,
+        item=args.item,
+        cycle_days=args.cycle_days,
+        next_due=args.next_due,
+    )
+    line = {
+        "plan_id": plan.plan_id,
+        "asset_id": plan.asset_id,
+        "item": plan.item,
+        "cycle_days": plan.cycle_days,
+        "next_due": plan.next_due,
+    }
+    print(json.dumps(line, ensure_ascii=False))
+    return 0
+
+
+def _run_due(args: argparse.Namespace) -> int:
+    records = query_due(start=args.start, end=args.end)
+    print(json.dumps({"records": records}, ensure_ascii=False))
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -117,6 +155,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_register(args)
         if args.command == "depreciate":
             return _run_depreciate(args)
+        if args.command == "plan":
+            return _run_plan(args)
+        if args.command == "due":
+            return _run_due(args)
         return _run_query(args)
     except LedgerError as error:
         print(f"error: {error}", file=sys.stderr)
